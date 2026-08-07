@@ -1,0 +1,33 @@
+{
+  "name": "@agentplan/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "agentplan": "./src/cli.tsx"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.tsx",
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx dev/smoke.ts",
+    "plan-once": "tsx dev/plan-once.ts",
+    "render-check": "tsx dev/render-check.tsx"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "ink": "^6.4.0",
+    "react": "^19.2.0",
+    "zod": "^4.1.11"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.2.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
