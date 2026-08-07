@@ -1,3 +1,4 @@
 node_modules/
 .agentplan/
 *.log
+.venv-everos/
