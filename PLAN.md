@@ -5,32 +5,19 @@
 
 ---
 
-## Context
+## 1. Context and scope
 
-**Why this exists.** The hackathon brief asks for a local-first harness where *one strong planner decomposes an engineering goal into subagents, and assigns each subagent its own model, harness, skills, tools, context, permissions, workspace, and budget — before any execution begins.* The thing being built is a **planner that allocates resources**, not a gateway that picks a model per prompt.
+**What the brief asks for.** A local-first harness where *one strong planner decomposes an engineering goal into subagents, and assigns each subagent its own model, harness, skills, tools, context, permissions, workspace, and budget — before any execution begins.* The thing being built is a **planner that allocates resources**, not a gateway that picks a model per prompt.
 
-**What prompted it.** `/Users/ivansandroid/Desktop/Snowflake-Agent-Token-Hackathon` is an empty `git init` — no commits, no files, no `package.json`. Every architectural decision below is therefore a greenfield choice justified against the local toolchain that *is* present, not against existing code.
+**Starting point.** The repo is a bare `git init` on `main`: zero commits, no files, no `package.json`, no remote, no env vars set. Every decision below is a greenfield choice justified against the local toolchain that *is* present (§3).
 
-**Intended outcome.** A locally-runnable app that: registers a git workspace → takes a goal → produces a validated task DAG with per-task model/harness assignments → executes 2–4 of those tasks across at least two different harnesses → streams status to a dashboard → records token/cost telemetry → writes execution memory to EverOS → shows actual vs. baseline cost.
+**Intended outcome.** A locally-runnable app that: registers a git workspace → takes a goal → produces a validated task DAG with per-task model/harness assignments → executes 2–4 tasks across at least two harnesses → streams status to a dashboard → records token/cost telemetry → writes execution memory to EverOS → shows actual vs. baseline cost.
 
-**Two scope decisions confirmed with the user:**
-1. Stack: Node API + Vite React SPA, pnpm workspaces.
-2. Planner: `claude -p --output-format json --json-schema`.
-3. **Snowflake is out of the MVP** — EverOS is the only sponsor integration. One concern, stated once and then dropped: this is a Snowflake-hosted hackathon and Track 1 is cost-reduction, so an empty Snowflake story may cost judging points. The mitigation baked into this plan is that the telemetry table is designed as a **flat, Snowflake-shaped fact table with an outbox column**, so `pnpm sync:snowflake` is a ~60-line file to add later, not a refactor. Beyond that, proceeding as directed.
+**Scope decisions confirmed with the user:**
 
----
-
-## 1. Executive summary
-
-Build **one local Node process** that owns a SQLite database, a child-process registry, and an SSE event bus, plus a small Vite React dashboard. The user registers a local git repo, types an engineering goal, and clicks **Create Plan**.
-
-Planning runs as a **read-only Claude Code session** (`claude -p --json-schema`, tools limited to `Read,Grep,Glob`). It sees the real repository, the model catalog, the **skills discovered on this machine and in this workspace**, and prior EverOS memories. In **one pass** it decides both how to decompose the work and who executes each piece, and returns a JSON-Schema-validated **`plan.json`**: a DAG of tasks, each with an explicitly assigned model + harness + skills + permissions + worktree policy + cost estimate + a written rationale for *why that model class*.
-
-**`plan.json` is the central product artifact** (§8), not a transient LLM response. Once validated it is frozen: the scheduler, the UI, the cost model, and the memory writer all read it, and no runtime state is ever written back into it. Claude Code is how the plan is *produced*; the plan is what the system *is*.
-
-Validation runs server-side against the registered catalog and skill registry, so a model, harness, or skill the planner invented is rejected before anything executes. The UI renders the DAG for inspection. On **Start Run**, a dependency-aware scheduler executes ready tasks in parallel — **each as its own OS process** driven by a harness adapter (`ClaudeCodeAdapter` → `claude -p`, `CodexAdapter` → `codex exec`, `GeminiAdapter` → `gemini`), running in either the main repo (read-only tasks) or a dedicated `git worktree` (writing tasks). These are peer processes under our supervisor, **not** Claude Code native subagents (§11). Events, tokens, and cost stream back live.
-
-Afterwards the run is written to EverOS as durable operational memory (which model/harness succeeded at which kind of task on which repo), and the dashboard shows **actual routed cost vs. an all-frontier baseline**, with every estimated figure explicitly labelled as estimated.
+1. Node API + Vite React SPA, pnpm workspaces.
+2. Planner is `claude -p --output-format json --json-schema`.
+3. **Snowflake is out of the MVP** — EverOS is the only sponsor integration. Concern stated once and dropped: this is a Snowflake-hosted hackathon and Track 1 is cost-reduction, so an empty Snowflake story may cost judging points. Mitigation: the telemetry table is shaped as a flat, Snowflake-ready fact table with an outbox column, so `pnpm sync:snowflake` is a ~60-line addition later, not a refactor (§16).
 
 ---
 
@@ -47,22 +34,7 @@ Afterwards the run is written to EverOS as durable operational memory (which mod
 | **Persistence** | Local SQLite + a run artifact directory |
 | **Memory** | EverOS (local, Markdown-backed) |
 
----
-
-## 3. What this is NOT
-
-- **Not OpenRouter / not an inference gateway.** There is no "send prompt, get model" path. Model choice is a *field on a planned task*, decided once during planning.
-- **Not a per-prompt router.** No runtime classifier picks a model per message. Decomposition and model/harness assignment are decided **jointly, by the planner, before execution**.
-- **Not a rebuild of Claude Code / Codex / Gemini CLI.** Those are treated as opaque harnesses driven over stdin/stdout.
-- **Not Claude Code native subagents.** A worker is *not* a Claude Code `Agent` invocation. There is no `Agent(model="codex")` anywhere in this system — that construct does not exist. A Codex-assigned task is executed by `CodexAdapter` spawning `codex exec`; a Gemini-assigned task by `GeminiAdapter` spawning `gemini`. Claude Code's own `--agents` / Agent tool is **not used** for cross-harness work. See §11.
-- **Not a Claude-only system.** The planner happens to run on Claude Code because it is the best available read-only, repo-aware, schema-validated planning surface on this machine. Workers can be **any model on any harness in the catalog**, and the architecture assumes they usually aren't Claude.
-- **Not a hosted SaaS.** No auth, no tenancy, no cloud database.
-- **Not an autonomous merge bot.** It never merges, rebases, or resolves conflicts automatically.
-- **Not a chain-of-thought viewer.** Reasoning blocks are filtered out of logs by design.
-
----
-
-## 4. Core differentiator
+**The core differentiator:**
 
 ```
 MODEL ROUTING (what we are not)
@@ -76,10 +48,10 @@ THIS SYSTEM
         │               costs · constraints · concurrency · prior memory
         ▼
    VALIDATED EXECUTION PLAN (a DAG, produced in full before execution)
-        ├── Task A · goal · Gemini Flash  · read-only · skills[repo-exploration]
-        ├── Task B · goal · Claude Opus 5 · read-only · depends A · skills[architecture]
-        ├── Task C · goal · Codex gpt-5.6 · worktree  · depends B · skills[ts-coding]
-        └── Task D · goal · Claude Sonnet 5 · read-only · depends C · skills[review]
+        ├── Task A · Gemini Flash    · read-only · skills[repo-exploration]
+        ├── Task B · Claude Opus 5   · read-only · depends A · skills[architecture]
+        ├── Task C · Codex gpt-5.6   · worktree  · depends B · skills[ts-coding]
+        └── Task D · Claude Sonnet 5 · read-only · depends C · skills[review]
         │
         ▼
    execution engine (dependency-ready → parallel → isolated)
@@ -87,44 +59,37 @@ THIS SYSTEM
 
 The planner answers **what work exists, who does it, what they need, and which engine runs it** — as one allocation decision, before execution.
 
+**What this is NOT:**
+
+- **Not an inference gateway / per-prompt router.** Model choice is a *field on a planned task*, decided once during planning. No runtime classifier.
+- **Not a rebuild of Claude Code / Codex / Gemini CLI.** They are opaque harnesses driven over stdin/stdout.
+- **Not Claude Code native subagents.** Workers are separate OS processes behind adapters — see §9, where this is specified once and load-bearing.
+- **Not a Claude-only system.** Claude Code runs the *planner* because it is the best read-only, repo-aware, schema-validated planning surface on this machine. Workers can be any catalog model on any harness, and the architecture assumes they usually aren't Claude.
+- **Not a hosted SaaS**, not an autonomous merge bot, not a chain-of-thought viewer.
+
 ---
 
-## 5. Current repository assessment
+## 3. Verified local toolchain
 
-The repo is **empty**: `git init` on `main`, **zero commits**, no tracked or untracked files, no remote.
-
-| Research question | Finding |
-|---|---|
-| Existing stack/framework | **None.** Greenfield. |
-| Existing backend | **None.** |
-| Existing persistence | **None.** SQLite is therefore a free choice, not a migration. |
-| Frontend/backend comms | **None.** |
-| Monorepo | **No** — but pnpm workspaces is the right shape for `server` + `web` + shared schemas. |
-| Package manager | Repo says nothing. Machine has **pnpm 10.27.0** (preferred), npm 11.6.2, bun 1.3.5. |
-| Testing framework | **None.** Recommend **Vitest** (one runner for server + shared package). |
-| Env var management | **None.** No `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `SNOWFLAKE_*`, or `EVERMIND_API_KEY` is set in the environment. |
-| Claude/Codex/Gemini integrations present | No code — but **all three CLIs are installed and already authenticated** (see below). |
-| Git/worktree handling present | **None.** |
-
-**Verified local toolchain:**
+The repo contributes nothing — no stack, backend, persistence, tests, env management, or git tooling exists. SQLite, Vitest, and pnpm workspaces are therefore free choices rather than migrations.
 
 | Tool | Version | Path | Auth state |
 |---|---|---|---|
 | `claude` | 2.1.224 | `~/.local/bin/claude` | Subscription/OAuth (no `ANTHROPIC_API_KEY`) |
-| `codex` | 0.146.0 | `/opt/homebrew/bin/codex` | ChatGPT OAuth tokens in `~/.codex/auth.json`; `OPENAI_API_KEY` is `null` |
+| `codex` | 0.146.0 | `/opt/homebrew/bin/codex` | ChatGPT OAuth in `~/.codex/auth.json`; `OPENAI_API_KEY` null |
 | `gemini` | 0.22.5 | `~/.bun/bin/gemini` | `~/.gemini` exists; no API key env var |
 | `node` | v25.1.0 | — | `node:sqlite` **verified working** (`DatabaseSync`, `StatementSync`) |
-| `pnpm` | 10.27.0 | — | — |
-| `python3` / `uv` | 3.12.3 / 0.9.17 | — | Meets EverOS's Python 3.12+ requirement |
+| `pnpm` | 10.27.0 | — | preferred; npm 11.6.2 and bun 1.3.5 also present |
+| `python3` / `uv` | 3.12.3 / 0.9.17 | — | meets EverOS's Python 3.12+ requirement |
 
 **Two consequences that shape the whole design:**
 
-1. **All three harnesses authenticate themselves.** The app spawns already-logged-in CLIs and never handles a provider API key for execution. This is the single biggest secret-management win available and the plan leans on it hard (§20).
-2. **Codex and Gemini are on subscription/OAuth auth, so there is no true marginal dollar cost for their tokens.** Only Claude Code returns real dollars (`total_cost_usd`). Every non-Claude cost figure in this product is therefore an **estimated equivalent API cost** and must be labelled as such (§21, §22). Not negotiable — fabricated savings would sink a Track 1 submission on inspection.
+1. **All three harnesses authenticate themselves.** The app spawns already-logged-in CLIs and never handles a provider API key. This is the biggest secret-management win available and the plan leans on it hard (§15).
+2. **Codex and Gemini are on subscription/OAuth auth, so their tokens have no true marginal dollar cost.** Only Claude Code returns real dollars (`total_cost_usd`). Every non-Claude cost figure is an **estimated equivalent API cost**, labelled as such everywhere it appears (§17). Not negotiable — fabricated savings would sink a Track 1 submission on inspection.
 
 ---
 
-## 6. Proposed system architecture
+## 4. System architecture
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -156,20 +121,13 @@ The repo is **empty**: `git init` on `main`, **zero commits**, no tracked or unt
    └───────────┴───────────┴──▶  ~/repo  and  ~/repo/.worktrees/<run>/<task>
 ```
 
-Everything runs on localhost. There is no network dependency other than the CLIs' own provider calls and the local EverOS server.
+**Why a single process:** the child-process registry, SSE bus, and scheduler must share memory. Everything binds to localhost; the only network dependencies are the CLIs' own provider calls and local EverOS.
 
 ---
 
-## 7. Planning / orchestrator architecture
+## 5. Planner
 
-The planner is a **read-only Claude Code session**. This is the key architectural choice and it buys four things at once:
-
-1. **Real repo awareness** — it uses `Read`/`Grep`/`Glob` to inspect the actual code, so task decomposition is grounded rather than generic.
-2. **Schema-validated output** — `--json-schema` puts the `ExecutionPlan` schema into the request; the response carries `structured_output`.
-3. **Exact planning cost** — the `json` result payload includes `total_cost_usd` plus a per-model breakdown. Planning cost is *measured*, not estimated.
-4. **Zero key handling** — it reuses the existing Claude Code login.
-
-**Exact invocation:**
+A **read-only Claude Code session**, which buys four things at once: real repo awareness via `Read`/`Grep`/`Glob`; schema-validated output via `--json-schema` → `structured_output`; *measured* planning cost via `total_cost_usd`; and zero key handling.
 
 ```bash
 claude -p "<planner prompt>" \
@@ -185,57 +143,46 @@ claude -p "<planner prompt>" \
   --no-session-persistence
 ```
 
-Run with `cwd` set to the workspace. `--permission-mode dontAsk` plus a read-only tool list means the planner physically cannot write. `--max-budget-usd` is a hard stop so a runaway planner cannot burn the demo budget.
+Run with `cwd` set to the workspace. `dontAsk` plus a read-only tool list means the planner physically cannot write; `--max-budget-usd` is a hard stop against a runaway planner.
 
-**What the planner receives** (assembled by `planner/prompt.ts`):
+**What the planner receives** (`planner/prompt.ts`): the goal verbatim · a **repository profile** (§10, compact facts not file dumps) · `CLAUDE.md`/`AGENTS.md`/`README.md` excerpts · the **skill registry** (id/name/description/applicability for every discovered skill — descriptions only, never instruction text, §8) · the **harness registry** (installed *and* authenticated right now) · the **model catalog** (only `enabled` rows with an available harness) · **constraints** (max cost, max parallelism, whether writes are permitted) · **prior memory** (top-k EverOS hits, §18).
 
-- The user's goal, verbatim.
-- A **repository profile** (§15) — compact facts, not file dumps.
-- **Project instructions** — `CLAUDE.md` / `AGENTS.md` / `README.md` excerpts if present.
-- The **skill registry** — `id`, `name`, `description`, applicable languages/roles for every skill **discovered in this workspace and on this machine** (§10). Descriptions only, never full instruction text.
-- The **harness registry** — which CLIs are installed *and* authenticated right now.
-- The **model catalog** — only rows with `enabled = 1` and an available harness.
-- **Constraints** — max total estimated cost, max parallelism, whether writes are permitted at all.
-- **Prior memory** — top-k EverOS hits for this repo profile (§23).
-
-**Decomposition and assignment are one decision, not two.** The planner is explicitly instructed to choose *how to split the work* and *who executes each piece* together, because the two constrain each other — a task is only worth splitting out if it can be handed to a cheaper or more suitable engine, and a model is only assignable once the work unit is bounded. There is deliberately **no** second-stage "now pick models for these tasks" pass, and no runtime router. The output of this single call is the frozen allocation.
+**Decomposition and assignment are one decision, not two.** The planner chooses *how to split the work* and *who executes each piece* together, because the two constrain each other — a task is only worth splitting out if it can be handed to a cheaper or more suitable engine, and a model is only assignable once the work unit is bounded. There is deliberately no second-stage "now pick models" pass and no runtime router. The output of this single call is the frozen allocation.
 
 **Hard rules in the planner system prompt:**
 
-- Emit only `model_id` / `harness_id` / `skill_id` values present in the supplied registries. Inventing one fails validation and the plan is rejected.
+- Emit only `model_id`/`harness_id`/`skill_id` values present in the supplied registries.
 - `model` and `harness` are chosen **per task**. Do not apply one model to the whole plan, and do not infer a model from a task's skills — skills carry no model.
 - Every task must carry `model_rationale` explaining *why this class of model* for *this work*. This is the artifact that proves the product is allocation, not routing.
 - Prefer the cheapest model that can do the work; reserve frontier models for high-leverage reasoning.
 - Do not implement anything. Emit a plan.
 - Read-only tasks share the main repo. Any task that writes gets `worktree.mode = "dedicated"`.
 
-**Post-generation validation pipeline** (`planner/validate.ts`) — five gates, all before anything executes:
+**Validation gates** (`planner/validate.ts`), all before anything executes:
 
 1. **Schema** — Zod parse of `structured_output`.
-2. **Registry** — every `model_id`/`harness_id`/`skill_id` exists and is enabled; the model is actually supported by the assigned harness.
-3. **Graph** — every dependency id resolves; no cycles (Kahn's algorithm); `context_from ⊆ dependencies`.
-4. **Permissions** — no task claims `write` while `worktree.mode = "none"`; no task claims `shell` without a declared allow-list.
-5. **Budget** — Σ `estimated_cost_usd` ≤ the run budget, else the plan is returned to the UI flagged `over_budget` for the user to accept or re-plan.
+2. **Registry** — every id exists and is enabled; the model is actually supported by the assigned harness.
+3. **Graph** — every dependency id resolves; no cycles (Kahn); `context_from ⊆ dependencies`.
+4. **Permissions** — no `write` while `worktree.mode = "none"`; no `shell` without a declared allow-list.
+5. **Budget** — Σ `estimated_cost_usd` ≤ run budget, else returned flagged `over_budget` for the user to accept or re-plan.
 
-Failures are surfaced in the UI with the offending field. One automatic re-plan is attempted with the validation errors appended to the prompt; a second failure is reported, not retried.
+Failures surface in the UI with the offending field. **One** automatic re-plan is attempted with the validation errors appended; a second failure is reported, not retried.
 
 ---
 
-## 8. Structured execution-plan schema — `plan.json` is the product
+## 6. `plan.json` — the product artifact
 
-**`plan.json` is the central artifact of this system, not a byproduct of an LLM call.** It is not "the planner's response"; it is a persisted, versioned, schema-validated allocation decision that everything downstream reads. The Claude Code planning call is merely how the first draft is *produced* — once validated, the plan stands on its own and is the thing the scheduler, the UI, the cost model, and the memory writer all consume. If the planner were swapped for a different engine tomorrow, `plan.json` would be unchanged in shape and everything downstream would keep working.
+**`plan.json` is the central artifact of this system, not a byproduct of an LLM call.** It is a persisted, versioned, schema-validated allocation decision that the scheduler, UI, cost model, and memory writer all read. The Claude Code call is merely how the first draft is produced; swap the planner tomorrow and `plan.json` is unchanged in shape.
 
 **Immutability contract:**
 
-- After validation passes, `plan.json` is written to `~/.agentplan/runs/<runId>/plan.json` and **never mutated again**. Written with mode `0444`; the DB copy in `runs.plan_json` is likewise write-once.
-- A re-plan does **not** edit a plan — it creates a **new run** with a new `plan.json`, so both remain inspectable and diffable (§40.9).
-- **No runtime field may ever appear in the plan schema.** `status`, `started_at`, `completed_at`, actual model used, actual tokens, actual duration, actual cost, exit code, worktree path, artifact paths — all live on the `tasks` runtime record (§28). A Zod `.strict()` parse plus a unit test asserting the plan schema contains none of those key names enforces this, so the boundary can't erode through casual edits.
+- After validation, written to `~/.agentplan/runs/<runId>/plan.json` with mode `0444` and **never mutated**. The DB copy in `runs.plan_json` is likewise write-once.
+- A re-plan creates a **new run** with a new `plan.json`, so both remain inspectable and diffable.
+- **No runtime field may ever appear in the plan schema** — `status`, timestamps, actual model/tokens/duration/cost, exit code, worktree path, artifact paths all live on the `tasks` runtime record (§14). A `.strict()` parse plus a unit test asserting the schema contains none of those key names keeps the boundary from eroding.
 
-Why this matters: actual-vs-planned comparison, baseline-vs-actual cost (§22), and the "did the planner allocate well?" question are all only answerable if the allocation decision is frozen and separable from what actually happened.
+This is what makes actual-vs-planned comparison, baseline-vs-actual cost (§17), and "did the planner allocate well?" answerable at all.
 
-Defined once in `packages/core/src/plan.ts` as Zod, with `zod-to-json-schema` producing the `--json-schema` payload. Single source of truth for the planner, the server, and the UI.
-
-Improvements over the schema sketched in the brief are marked **[+]**.
+Defined once in `packages/core/src/plan.ts` as Zod, with `zod-to-json-schema` producing the `--json-schema` payload — single source of truth for planner, server, and UI. Improvements over the brief's sketch are marked **[+]**.
 
 ```ts
 ExecutionPlan {
@@ -262,9 +209,9 @@ PlannedTask {
   model: ModelId                         // must exist in the catalog
   model_rationale: string                // [+] REQUIRED. why this model class.
 
-  skills: SkillId[]                      // 0..n — multi-select. Resolved against the
-                                         // SkillRegistry (§10). A skill NEVER carries
-                                         // a model; model is assigned here, on the task.
+  skills: SkillId[]                      // 0..n — multi-select, resolved against the
+                                         // SkillRegistry (§8). Skills carry no model;
+                                         // model is assigned here, on the task.
   tools: ToolId[]                        // "read" | "edit" | "bash" | "web" | "git"
 
   relevant_files: string[]               // repo-relative hints, not a hard limit
@@ -285,8 +232,7 @@ PlannedTask {
   }
 
   execution {
-    worktree: { mode: "none" | "shared" | "dedicated",
-                branch_hint?: string }
+    worktree: { mode: "none" | "shared" | "dedicated", branch_hint?: string }
     parallelizable: boolean
     max_turns: number
     timeout_seconds: number
@@ -307,13 +253,11 @@ PlannedTask {
 }
 ```
 
-Note what is **absent** by design: no `status`, no timestamps, no actual usage, no worktree path. Those belong to the runtime record per the immutability contract above. The plan is the allocation decision; the `tasks` row is the execution record.
-
 ---
 
-## 9. Model catalog design
+## 7. Model catalog
 
-A **seeded, editable table** — not a hardcoded map, not a scraped API. Capability is expressed as **tags and coarse tiers we chose**, never as invented numeric scores.
+A **seeded, editable table** — not a hardcoded map, not a scraped API. Capability is expressed as **tags and coarse tiers we chose**, never invented numeric scores. Editable from Settings so it can evolve during the hackathon without a code change.
 
 ```ts
 ModelCatalogEntry {
@@ -338,8 +282,6 @@ ModelCatalogEntry {
 }
 ```
 
-**Seed rows.** Anthropic prices are published per-MTok. Codex/Gemini prices are marked `subscription-no-marginal-cost` because the local auth is OAuth/subscription — the UI shows *equivalent* cost from the published API rate where one exists, always labelled.
-
 | id | provider | harnesses | in/out $/MTok | tier | capabilities |
 |---|---|---|---|---|---|
 | `claude-opus-5` | anthropic | claude-code | 5 / 25 | premium | architecture, review, long-context, structured-output |
@@ -350,23 +292,17 @@ ModelCatalogEntry {
 | `gemini-2.5-flash` | google | gemini-cli | subscription | low | repo-exploration, broad reading, extraction |
 | `gemini-2.5-pro` | google | gemini-cli | subscription | high | analysis, long-context |
 
-Anthropic IDs and prices are taken from the current model catalog. Codex slugs are read from the machine's own `~/.codex/models_cache.json` (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`), so they are real for this install rather than guessed.
+Anthropic IDs and prices come from the current published catalog. Codex slugs are read from this machine's own `~/.codex/models_cache.json` (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`), so they are real for this install rather than guessed. Subscription rows show *equivalent* cost from the published API rate where one exists, always labelled.
 
-**Availability probe at boot** (`harness/detect.ts`): `which` each binary + a cheap `--version`; mark rows `not-installed` / `unauthenticated` accordingly. Unavailable models are filtered out of the planner's catalog, which is *why the planner cannot assign something that won't run*.
-
-Editable from the Settings screen, so the catalog can evolve during the hackathon without a code change.
+**Availability probe at boot** (`harness/detect.ts`): `which` each binary + a cheap `--version`; mark rows `not-installed`/`unauthenticated`. Unavailable models are filtered out of the planner's catalog — that is *why the planner cannot assign something that won't run*.
 
 ---
 
-## 10. Skill registry design — discovery-first, never model-bound
+## 8. Skill registry — discovery-first, never model-bound
 
-A skill is **reusable procedural knowledge**, injected as text into a worker's task context. It is not a model, not a tool, and not a harness.
+A skill is **reusable procedural knowledge**, injected as text into a worker's task context. It is not a model, not a tool, not a harness.
 
-### Skills are discovered from the workspace and the user, not authored by this app
-
-The application is **not** the primary source of skills. Real repos and real users already have reusable procedural knowledge on disk, and duplicating it into `server/src/skills/*.md` would fork it and let it rot. The skill layer **discovers and normalizes** instead.
-
-**Scan order (precedence: first match wins on id collision):**
+**Skills are discovered, not authored by this app.** Real repos and users already have this knowledge on disk; duplicating it into `server/src/skills/*.md` would fork it and let it rot.
 
 | Precedence | Location | Scope |
 |---|---|---|
@@ -376,17 +312,11 @@ The application is **not** the primary source of skills. Real repos and real use
 | 4 | `~/.claude/skills/` | User-level (this machine already has ~24 skills here) |
 | 5 (lowest) | app built-ins | **Fallback only** |
 
-A workspace or user skill **shadows** a built-in of the same id. Built-ins exist so a bare repo with no skills directory still produces a sensible plan — they are a floor, not the source of truth.
+First match wins on id collision, so a workspace or user skill **shadows** a built-in. Built-ins exist so a bare repo still produces a sensible plan — a floor, not the source of truth. Shipped built-ins: `repo-exploration`, `code-implementation`, `testing`, `architecture-review`, `security-review`, `git-review` — deliberately generic; anything project-specific belongs in the workspace where its owners can version it.
 
-**Read in place. Never copied.** The registry stores a *pointer* (`source_path`, `source_scope`, `mtime`, `content_hash`) and the normalized fields. Instruction text is read from the original file at context-packet build time, so editing `<repo>/.claude/skills/testing/SKILL.md` changes worker behavior on the next run with no re-import step. Re-scan on workspace registration, on a Settings refresh, and when a cached `mtime`/hash no longer matches.
+**Read in place, never copied.** The registry stores a pointer (`source_path`, `source_scope`, `mtime`, `content_hash`) plus normalized fields; instruction text is read from the original file at packet-build time, so editing `<repo>/.claude/skills/testing/SKILL.md` changes worker behavior on the next run with no re-import. Re-scan on workspace registration, on Settings refresh, and when a cached `mtime`/hash mismatches.
 
-**Formats accepted** (both are normalized to the same shape):
-- **Directory form** — `<dir>/SKILL.md` with YAML front-matter (`name`, `description`, optional `languages`, `roles`). Sibling files in the directory are treated as skill resources and their paths are passed through.
-- **Flat form** — `<name>.md`, front-matter optional; falls back to filename as id and first heading/paragraph as description.
-
-Unparseable files are skipped with a warning, never fatal — a malformed skill in someone's home directory must not break planning.
-
-### Normalized shape
+**Formats accepted**, both normalized to one shape: **directory form** (`<dir>/SKILL.md` with YAML front-matter `name`, `description`, optional `languages`, `roles`; siblings become resource paths) and **flat form** (`<name>.md`, front-matter optional, falling back to filename as id and first heading/paragraph as description). Unparseable files are skipped with a warning, never fatally — a malformed skill in someone's home directory must not break planning.
 
 ```ts
 Skill {
@@ -399,72 +329,41 @@ Skill {
                 | "user-agents" | "user-claude" | "builtin"
     content_hash: string
   }
-  resource_paths: string[]      // sibling files, passed as paths (worker can read them)
+  resource_paths: string[]      // sibling files, passed as paths
   applies_to_languages: string[] | null
   applies_to_roles: AgentRole[] | null
-  // NOTE: there is deliberately NO `model` field, and no `harness` field.
 }
 ```
 
-**No skill may have a model permanently attached to it.** This is a hard invariant, not a convention: `Skill` has no `model` key, the Zod schema is `.strict()` so a discovered file declaring `model:` in its front-matter has that key rejected (with a warning naming the file), and a unit test asserts it. A skill describes *how to do a kind of work*; the planner decides *who does it and on what engine*, per task. Binding a model to a skill would collapse the product back into static routing, which is precisely the thing this system is not.
+**No skill may have a model or harness attached — a hard invariant, not a convention.** `Skill` has no such key, the Zod schema is `.strict()` so a discovered file declaring `model:` has that key rejected (with a warning naming the file), and a unit test asserts it. A skill describes *how to do a kind of work*; the planner decides *who does it and on what engine*, per task. Binding a model to a skill collapses the product back into static routing.
 
-### Selection and injection
+**Selection and injection.** The planner sees only `id`/`name`/`description`/`applies_to_*`. A task selects zero or more skills — multi-select is normal (`typescript-coding` + `testing` + a workspace `house-style`). The worker receives resolved instruction text in its context packet (§10) plus `resource_paths` to read itself. The text is identical across harnesses; only the transport differs: Claude Code `--append-system-prompt`, Codex a prepended `## Skills` block in the stdin prompt, Gemini the same block in the positional prompt.
 
-- **The planner sees** `id`, `name`, `description`, `applies_to_*` for every discovered skill — never the full instruction text, which would blow up the planning prompt for no benefit.
-- **A task selects zero or more skills.** Multi-select is normal: an implementer task might carry `typescript-coding` + `testing` + a workspace-specific `house-style`.
-- **The worker receives** the resolved instruction text in its context packet (§15), plus `resource_paths` it can read from disk itself.
-
-**Injection is harness-specific** — the text is identical, only the transport differs:
-
-| Harness | Mechanism |
-|---|---|
-| Claude Code | `--append-system-prompt` (keeps the objective prompt clean) |
-| Codex | prepended `## Skills` block in the stdin prompt |
-| Gemini | prepended `## Skills` block in the positional prompt |
-
-Built-in fallbacks shipped with the app (used only when nothing shadows them): `repo-exploration`, `code-implementation`, `testing`, `architecture-review`, `security-review`, `git-review`. Deliberately generic and language-agnostic — anything project-specific belongs in the workspace, where it can be version-controlled by the people who own it.
-
-### The five-way distinction — enforced in the type system, not just documented
-
-This vocabulary is used consistently in code, DB columns, API fields, and UI labels. Where the type system can enforce a separation, it does.
+**The five-way distinction**, used consistently in code, DB columns, API fields, and UI labels — enforced by the type system where possible:
 
 | Concept | Definition | Where it lives | Enforcement |
 |---|---|---|---|
-| **PlannedTask** | The unit that **binds** objective + skills + harness + model + context + permissions | `plan.tasks[]` | The only place `model` and `harness` may co-occur with `skills` |
-| **Skill** | Reusable procedural knowledge — *how* to do a kind of work | `SkillRegistry`, sourced from disk (§10) | `Skill` type has **no** `model` and **no** `harness` field; `.strict()` rejects them |
-| **Tool** | A capability/action a worker may perform | `permissions` + harness tool flags | Mapped to each harness's own sandbox/allow flags |
-| **Harness** | The coding-agent **execution environment** that runs the agent loop | `CodingHarness` adapter → an OS process | One adapter per CLI; never a Claude native subagent (§11) |
-| **Model** | The **inference/reasoning resource** | `task.model` → the harness's `--model` flag | Must exist in the catalog *and* be supported by the assigned harness |
+| **PlannedTask** | **Binds** objective + skills + harness + model + context + permissions | `plan.tasks[]` | The only place `model` and `harness` co-occur with `skills` |
+| **Skill** | Reusable procedural knowledge — *how* to do a kind of work | `SkillRegistry`, sourced from disk | No `model`/`harness` field; `.strict()` rejects them |
+| **Tool** | A capability a worker may perform | `permissions` + harness tool flags | Mapped to each harness's sandbox/allow flags |
+| **Harness** | The **execution environment** running the agent loop | `CodingHarness` adapter → an OS process | One adapter per CLI (§9) |
+| **Model** | The **inference resource** | `task.model` → the harness's `--model` flag | Must exist in the catalog *and* be supported by the harness |
 
-Read the failure modes this prevents: a skill with a model attached is static routing; a model without a harness is unrunnable; a harness that is really a nested subagent isn't multi-vendor; and a task that doesn't bind all four isn't an allocation decision.
+The failure modes this prevents: a skill with a model attached is static routing; a model without a harness is unrunnable; a harness that is really a nested subagent isn't multi-vendor; a task that doesn't bind all four isn't an allocation decision.
 
 ---
 
-## 11. Harness adapter architecture
+## 9. Harness adapters
 
-### What a "worker" is — and what it is not
+### A worker is an OS process, not a native subagent
 
-At the **product level** we say *agent*, *worker*, or *subagent* interchangeably for one executing `PlannedTask`, and the UI uses that language. At the **implementation level** the distinction below is load-bearing and must not be blurred in code, types, logs, or docs:
+At the product level we say *agent*/*worker*/*subagent* interchangeably for one executing `PlannedTask`. At the implementation level: a worker is a `PlannedTask` executed by a harness adapter as a **separate OS process** with its own PID, process group, and `cwd`/worktree, controlled by our scheduler from the frozen plan and running the model the *plan* assigned. Claude Code's own `Agent` tool / `--agents` definitions — spawned inside one Claude Code session, controlled by the model mid-conversation — are **not used**: no `--agents` JSON is passed, and the Agent tool is in no worker's `--allowedTools`.
 
-| | Claude Code **native subagent** | This system's **worker** |
-|---|---|---|
-| What it is | Claude Code's own `Agent` tool / `--agents` definitions, spawned *inside* one Claude Code session | A `PlannedTask` executed by a harness adapter as a **separate OS process** |
-| Who controls it | The Claude model, mid-conversation | Our scheduler, from the frozen plan |
-| Model | Whatever Claude Code assigns internally | Whatever the **plan** assigned to that task |
-| Process | Same process | Own PID, own process group, own `cwd`/worktree |
-| Used here? | **No** — not for cross-harness work | **Yes** — this is the execution unit |
+**There is no `Agent(model="codex")` in this system, and the plan must never be read as implying one.** `harness: "codex"` → `spawn("codex", ["exec", ...])`, a real process running OpenAI's CLI on OpenAI's credentials. `harness: "gemini-cli"` → `spawn("gemini", [...])`. `harness: "claude-code"` → `spawn("claude", ["-p", ...])`, a **top-level** process — not nested under the planner session, which has long since exited by the time workers run. Every worker is a peer under our supervisor; this is what makes the system genuinely multi-vendor rather than Claude-with-extra-steps.
 
-**There is no such thing as `Agent(model="codex")` in this system, and the plan must never be read as implying one.** Concretely:
+The one place Claude Code is privileged is the planner (§5) — an implementation choice about the planning step, not a constraint on workers.
 
-- A task with `harness: "codex"` → `CodexAdapter` → `spawn("codex", ["exec", ...])`. A real OS process running OpenAI's CLI, authenticated by OpenAI's own credential store.
-- A task with `harness: "gemini-cli"` → `GeminiAdapter` → `spawn("gemini", [...])`. A real OS process running Google's CLI.
-- A task with `harness: "claude-code"` → `ClaudeCodeAdapter` → `spawn("claude", ["-p", ...])`. A **top-level** Claude Code process — still one process per task, still driven by our scheduler. It is *not* a nested subagent of the planner session, and the planner session has long since exited by the time workers run.
-
-Claude Code's native subagent machinery is **not used**: no `--agents` JSON is passed, and the Agent tool is not in any worker's `--allowedTools`. Every worker is a peer process under our supervisor. This is what makes the system genuinely multi-vendor rather than Claude-with-extra-steps, and it is why the harness layer is an adapter interface rather than a Claude configuration.
-
-The one place Claude Code *is* privileged: it runs the **planner** (§7), because it is the best read-only, repo-aware, JSON-Schema-validated planning surface available on this machine. That is an implementation choice about the planning step, not a constraint on workers.
-
-### The adapter interface
+### The interface
 
 ```ts
 interface CodingHarness {
@@ -474,13 +373,13 @@ interface CodingHarness {
 
   execute(input: {
     task: PlannedTask;
-    packet: ContextPacket;      // §15
+    packet: ContextPacket;      // §10
     cwd: string;                // repo root or dedicated worktree
     signal: AbortSignal;
   }): AsyncIterable<HarnessEvent>;
 
-  // cancel() is deliberately absent — cancellation is the AbortSignal.
-  // Uniform process-tree kill lives in one place (§29), not per adapter.
+  // cancel() is deliberately absent — cancellation is the AbortSignal, and
+  // uniform process-tree kill lives in one place (§12), not per adapter.
 }
 
 type HarnessEvent =
@@ -499,17 +398,29 @@ type NormalizedUsage = {
 };
 ```
 
-Every adapter is a thin translator: build argv → spawn → parse the harness's own stream → emit `HarnessEvent`. All process supervision, timeout, and cancellation is shared (§17).
+Every adapter is a thin translator: build argv → spawn → parse the harness's stream → emit `HarnessEvent`. `costIsExact` is what lets the usage dashboard be honest without special-casing providers in the UI.
 
-**Design note:** `costIsExact` on `finished` is what lets the usage dashboard be honest without special-casing providers in the UI.
+### CLI capability matrix
 
----
+Verified against `claude --help` 2.1.224, `codex exec --help` 0.146.0, `gemini --help` 0.22.5.
 
-## 12. Claude Code integration
+| Requirement | Claude Code | Codex | Gemini |
+|---|---|---|---|
+| Pass prompt | positional after `-p` (stdin ≤10MB) | positional, or stdin when omitted / `-` | **positional** (`-p` deprecated); stdin appended |
+| Specify model | `--model` (alias or full id) | `-m/--model` | `-m/--model` |
+| Working dir | process `cwd` + `--add-dir` | **`-C/--cd <DIR>`** (+ `--add-dir`) | **no `--cd`** — must set spawn `cwd`; `--include-directories` adds scope |
+| Non-interactive | `-p` / `--print` | `codex exec` | positional query is one-shot |
+| Structured output | `--json-schema` + `--output-format json` → `structured_output` | **`--output-schema <FILE>`** | none — prompted JSON contract + Zod parse (read-only roles only) |
+| Stream | `--output-format stream-json --verbose` (NDJSON) | `--json` → JSONL (`thread.started`, `item.*`, `turn.completed`) | `--output-format stream-json` (`json` for one-shot) |
+| Cancellation | SIGTERM aborts the turn, kills the Bash tree, exits **143** | SIGTERM on the process group | SIGTERM on the process group |
+| **Token usage** | `result` event `usage` | `turn.completed.usage {input, cached_input, output}` — **cumulative** | `stats.models[m].tokens {prompt, candidates, cached, total, thoughts, tool}` |
+| **Cost** | `result.total_cost_usd` + per-model breakdown — **exact dollars** | not returned → derived, flagged estimated | not returned → derived, flagged estimated |
+| Permissions | `--permission-mode`, `--allowedTools`, `--disallowedTools`, `--tools` | `--sandbox read-only \| workspace-write \| danger-full-access` | `--approval-mode default\|auto_edit\|yolo`, `--allowed-tools` |
+| Worktrees | native `-w/--worktree` **not used** | none | none |
 
-Verified against `claude --help` (v2.1.224) and the current headless docs.
+We manage worktrees ourselves for cross-harness uniformity (§13).
 
-**Worker invocation:**
+**Invocations:**
 
 ```bash
 claude -p "<objective + context packet>" \
@@ -518,148 +429,68 @@ claude -p "<objective + context packet>" \
   --permission-mode <acceptEdits | dontAsk> \
   --allowedTools "<Read,Grep,Glob[,Edit,Write,Bash(...)]>" \
   --append-system-prompt "<skills>" \
-  --add-dir "<worktree>" \
-  --max-turns <n> \
-  --no-session-persistence \
-  --session-id <uuid>
-```
-`cwd` = the task's worktree.
+  --add-dir "<worktree>" --max-turns <n> \
+  --no-session-persistence --session-id <uuid>          # cwd = the task's worktree
 
-| Requirement | Answer |
-|---|---|
-| Pass prompt | Positional arg after `-p` (stdin also works, ≤10MB) |
-| Specify model | `--model` (alias `opus`/`sonnet`, or full id) |
-| Working directory | Process `cwd` + `--add-dir` |
-| Non-interactive | `-p` / `--print` |
-| Structured output | `--json-schema` + `--output-format json` → `structured_output` |
-| Stream stdout | `--output-format stream-json --verbose`, NDJSON |
-| Cancellation | SIGTERM → aborts turn, kills the Bash process tree, exits **143** |
-| Exit status | 0 success, non-zero failure |
-| **Token usage** | `result` event `usage` |
-| **Cost** | `result` event **`total_cost_usd`** + per-model breakdown — **exact dollars** |
-| Permissions | `--permission-mode`, `--allowedTools`, `--disallowedTools`, `--tools` |
-| Worktrees | Has native `-w/--worktree`, **not used** — we manage worktrees ourselves for cross-harness uniformity |
-
-**Extras worth using:** `--max-budget-usd` as a per-task hard cap; `--effort` mapped from `execution.effort`; `--bare` is *not* used for workers (we want the workspace's `CLAUDE.md` loaded) but *is* worth considering for the planner if cross-machine reproducibility becomes an issue.
-
-**Stream parsing:** read NDJSON lines; `system/init` → `started`; `assistant` messages → `tool` events built from `tool_use` blocks; **`thinking` blocks are dropped** (§30); `result` → `finished` with `costIsExact: true`.
-
----
-
-## 13. Codex integration
-
-Verified against `codex exec --help` (codex-cli 0.146.0).
-
-```bash
 codex exec "<objective + context packet>" \
   --model <gpt-5.6-sol | gpt-5.4-mini | ...> \
   -c model_reasoning_effort="<low|medium|high|xhigh|max>" \
-  --cd "<worktree>" \
-  --sandbox <read-only | workspace-write> \
-  --json \
-  --output-last-message "<runs/.../last_message.txt>" \
-  --skip-git-repo-check
-```
+  --cd "<worktree>" --sandbox <read-only | workspace-write> \
+  --json --output-last-message "<runs/.../last_message.txt>" --skip-git-repo-check
 
-| Requirement | Answer |
-|---|---|
-| Pass prompt | Positional, or stdin when omitted / `-` |
-| Specify model | `-m/--model` |
-| Working directory | **`-C/--cd <DIR>`** (native — plus `--add-dir` for extra writable dirs) |
-| Non-interactive | `codex exec` |
-| Structured output | **`--output-schema <FILE>`** — a JSON Schema file for the final response |
-| Stream stdout | `--json` → JSONL events (`thread.started`, `item.started/updated/completed`, `turn.completed`) |
-| Cancellation | SIGTERM on the process group |
-| Exit status | standard |
-| **Token usage** | `turn.completed` → `usage { input_tokens, cached_input_tokens, output_tokens }` — **cumulative for the session** |
-| **Cost** | **Not returned.** Derived from tokens × catalog price, flagged estimated |
-| Permissions | `--sandbox read-only \| workspace-write \| danger-full-access` — maps cleanly to our `permissions.filesystem` |
-| Worktrees | No native support; ours, via `--cd` |
-
-**Two implementation notes:**
-- `turn.completed.usage` is **cumulative**, so the last event wins — don't sum across turns or you'll double-count.
-- Reasoning items appear in the JSONL stream; filter `item.type === "reasoning"` before writing logs.
-- `--dangerously-bypass-approvals-and-sandbox` exists and is **never** used.
-
----
-
-## 14. Gemini integration
-
-Verified against `gemini --help` (v0.22.5).
-
-```bash
 gemini "<objective + context packet>" \
   --model <gemini-2.5-flash | gemini-2.5-pro> \
-  --output-format json \
-  --approval-mode <default | auto_edit | yolo> \
-  --include-directories "<worktree>"
+  --output-format json --approval-mode <default | auto_edit> \
+  --include-directories "<worktree>"                     # cwd = the task's worktree
 ```
-`cwd` = the task's worktree.
 
-| Requirement | Answer |
-|---|---|
-| Pass prompt | **Positional** (`-p/--prompt` is deprecated); stdin is appended |
-| Specify model | `-m/--model` |
-| Working directory | **No `--cd` flag** — must set the spawn `cwd`; `--include-directories` adds scope |
-| Non-interactive | Positional query defaults to one-shot |
-| Structured output | No JSON-Schema flag; use a prompted JSON contract + Zod parse (read-only roles only) |
-| Stream stdout | `--output-format stream-json` (json for one-shot) |
-| Cancellation | SIGTERM on the process group |
-| **Token usage** | `stats.models[<model>].tokens { prompt, candidates, cached, total, thoughts, tool }` |
-| **Cost** | Not returned. Derived; flagged estimated |
-| Permissions | `--approval-mode default\|auto_edit\|yolo`, `--allowed-tools <array>`; `--yolo` never used |
-| Worktrees | No native support; ours, via `cwd` |
+**Parsing notes, one per harness:**
 
-**Token mapping:** `prompt → inputTokens`, `candidates → outputTokens`, `cached → cachedInputTokens`, `thoughts → reasoningTokens`. Note `total` already includes `thoughts` and `tool` — recompute rather than trusting it, so the three harnesses normalize identically.
-
-**Role fit:** Gemini is the exploration/extraction harness in the MVP (cheap, fast, broad reading, read-only). Not the implementer.
+- **Claude** — `system/init` → `started`; `assistant` messages → `tool` events from `tool_use` blocks; **`thinking` blocks dropped** (§16); `result` → `finished` with `costIsExact: true`. Extras used: `--max-budget-usd` as a per-task cap, `--effort` mapped from `execution.effort`. `--bare` is *not* used for workers (we want the workspace's `CLAUDE.md`) but is worth considering for the planner if cross-machine reproducibility becomes an issue.
+- **Codex** — `turn.completed.usage` is **cumulative**, so last-event-wins; summing double-counts. Filter `item.type === "reasoning"` before writing logs. `--dangerously-bypass-approvals-and-sandbox` is never emitted.
+- **Gemini** — map `prompt → inputTokens`, `candidates → outputTokens`, `cached → cachedInputTokens`, `thoughts → reasoningTokens`. `total` already includes `thoughts` and `tool`, so **recompute** rather than trusting it, keeping all three harnesses identical. `--yolo` is never emitted. Role fit: the exploration/extraction harness in the MVP — cheap, fast, broad reading, read-only. Not the implementer.
 
 ---
 
-## 15. Context-packet design
+## 10. Context packets
 
 Two rules govern this layer:
 
 1. **The planner's conversation is never copied into workers.** Each worker gets a compact, purpose-built packet — not a transcript.
-2. **The worker gets repository context by *running in the repository*, not by having it pasted into a prompt.** Every harness is a real coding agent with real filesystem tools, executing with `cwd` set to the workspace or the task's worktree. So the packet carries **pointers and facts** — paths, a profile, a directory shape — and lets the worker `Read`/`Grep`/`Glob` for itself. Inlining source files would waste tokens, go stale the moment an upstream task writes, and duplicate a capability the worker already has.
+2. **The worker gets repository context by *running in the repository*.** Every harness is a real coding agent with real filesystem tools, executing with `cwd` set to the workspace or worktree. The packet carries **pointers and facts**; the worker `Read`/`Grep`/`Glob`s for itself. Inlining source would waste tokens, go stale the moment an upstream task writes, and duplicate a capability the worker already has.
 
-The one thing that *is* inlined is what the worker cannot obtain from the filesystem: skill instructions and upstream task summaries.
+The only inlined content is what the worker cannot obtain from the filesystem: skill instructions and upstream task summaries.
 
 ```ts
 ContextPacket {
   run_id, task_id
-  workspace_path: string                 // the cwd the worker will actually run in
-                                         // (repo root for read-only, worktree for writers)
+  workspace_path: string                 // the cwd the worker actually runs in
   objective: string
   acceptance_criteria: string[]
   constraints: string[]                  // permission summary in plain English
   project_instructions: string | null    // CLAUDE.md / AGENTS.md — inlined; it is
                                          // instruction, not source, and is short
   repo_facts: RepoProfile                // ~2KB of derived facts, NOT file contents
-  relevant_paths: string[]               // POINTERS — "look here first", not contents.
-                                         // Non-binding: the worker may read anything
-                                         // its permissions allow.
-  upstream: Array<{                      // one per context_from entry — inlined, because
-    task_id, task_name, summary,         // a sibling task's reasoning exists nowhere
-    key_findings: string[],              // on disk the worker can reach
+  relevant_paths: string[]               // POINTERS — non-binding; the worker may
+                                         // read anything its permissions allow
+  upstream: Array<{                      // one per context_from — inlined, because a
+    task_id, task_name, summary,         // sibling's reasoning exists nowhere on disk
+    key_findings: string[],
     artifact_paths: string[]             // ...but its artifacts are passed as paths
   }>
   skills: Array<{ id, name, instructions, resource_paths }>
-                                         // instructions inlined (read from source at
-                                         // build time per §10); resources as paths
   expected_output: string                // exact contract, incl. the summary block
   assignment: { harness, model, effort }
 }
 ```
 
-**Consequence for diffs.** A reviewer task does not get the implementation's source pasted in — it gets the worktree path plus `patch.diff`'s path, and reads them itself with the tools it already has. This keeps review packets small and, more importantly, keeps the reviewer looking at the *actual* current state of the tree rather than a snapshot taken at packet-build time.
+**Consequence for diffs.** A reviewer task gets the worktree path plus `patch.diff`'s path, not pasted source — keeping review packets small and, more importantly, keeping the reviewer looking at the *actual* current tree rather than a build-time snapshot.
 
-Rendered by `context/render.ts` into a single markdown prompt string, ordered stable-first (project instructions → repo facts → skills → upstream → objective) so any harness-side prompt caching can actually hit.
+Rendered by `context/render.ts` into one markdown string, ordered stable-first (project instructions → repo facts → skills → upstream → objective) so harness-side prompt caching can hit.
 
-**RepoProfile** (`workspace/profile.ts`) — cheap, deterministic, no LLM:
-git branch/HEAD/dirty state · root file listing · detected languages by extension histogram · package manager · framework hints from `package.json` deps · test runner · presence of `CLAUDE.md`/`AGENTS.md`/`README.md` · top-level directory tree to depth 2 · LOC by language. Target ≤ 2 KB.
+**RepoProfile** (`workspace/profile.ts`) — cheap, deterministic, no LLM: git branch/HEAD/dirty state · root file listing · languages by extension histogram · package manager · framework hints from `package.json` deps · test runner · presence of `CLAUDE.md`/`AGENTS.md`/`README.md` · directory tree to depth 2 · LOC by language. Target ≤ 2 KB.
 
-**Worker output contract.** Every worker is instructed to end its response with a fenced block:
+**Worker output contract.** Every worker ends its response with a fenced block:
 
 ````
 ```agentplan-summary
@@ -668,301 +499,85 @@ git branch/HEAD/dirty state · root file listing · detected languages by extens
 ```
 ````
 
-Parsed by `context/summary.ts`. If missing or malformed, the harness's own final message is stored as `summary` and `key_findings` is left empty — degraded, never fatal. Claude Code tasks can additionally use `--json-schema` for a guaranteed shape; Codex can use `--output-schema`. Gemini relies on the prompted contract.
+Parsed by `context/summary.ts`. If missing or malformed, the harness's final message is stored as `summary` with empty `key_findings` — degraded, never fatal. Claude tasks can additionally use `--json-schema`, Codex `--output-schema`; Gemini relies on the prompted contract.
 
-**Artifact persistence — files on disk, rows in SQLite pointing at them:**
+**Artifacts on disk, rows in SQLite pointing at them** — diffs and logs are large awkward blobs; SQLite holds the queryable facts and the path, which keeps aggregate queries fast and artifacts trivially inspectable during a demo.
 
 ```
 ~/.agentplan/runs/<runId>/
   plan.json
   planner-stdout.json
   tasks/<taskId>/
-    context-packet.md
-    summary.json
-    output.md
-    patch.diff
-    events.ndjson
-    stderr.log
+    context-packet.md  summary.json  output.md
+    patch.diff         events.ndjson  stderr.log
 ```
-
-Rationale: diffs and logs are large, awkward blobs; SQLite holds the queryable facts and the path. This keeps the usage dashboard's aggregate queries fast and makes artifacts trivially inspectable during a demo.
 
 ---
 
-## 16. Dependency / DAG execution
+## 11. Scheduler
 
-`scheduler/scheduler.ts`, a straightforward ready-set loop:
+`scheduler/scheduler.ts`, a ready-set loop:
 
 1. Build adjacency + indegree from `dependencies`. Cycles already rejected at validation.
-2. `ready` = tasks with `status = "queued"` and all deps `completed`.
-3. Dispatch from `ready` while `running.size < concurrency_limit`.
-4. **Worktree serialization:** at most one `dedicated`-worktree task per branch at a time; `none`/`shared` tasks may run freely in parallel against the main repo (they cannot write).
-5. On task completion → persist artifacts → recompute ready set → repeat.
-6. On task failure → mark dependents `blocked` (transitively), leave independent branches running.
-7. Run terminates when nothing is running and nothing is ready.
+2. `ready` = `queued` tasks whose deps are all `completed`.
+3. Dispatch while `running.size < concurrency_limit`.
+4. **Worktree serialization:** at most one `dedicated`-worktree task per branch at a time; `none`/`shared` tasks run freely in parallel against the main repo (they cannot write).
+5. On completion → persist artifacts → recompute ready set → repeat.
+6. On failure → mark dependents `blocked` transitively, leave independent branches running.
+7. Terminate when nothing is running and nothing is ready.
 
-**Lifecycle:** `planned → queued → running → completed | failed | blocked | cancelled`
-
-`planned` is the state at plan-emit time. `queued` on Start Run. `blocked` means an upstream dependency failed (distinct from `failed`). `cancelled` is user-initiated. Recorded on both `runs` and `tasks`.
+**Lifecycle:** `planned → queued → running → completed | failed | blocked | cancelled`, recorded on both `runs` and `tasks`. `planned` is the state at plan-emit time; `queued` on Start Run; `blocked` means an upstream failed (distinct from `failed`); `cancelled` is user-initiated.
 
 Default `concurrency_limit` = 3 (planner may lower it; server clamps to a Settings max), chosen to keep three provider CLIs' rate limits and a laptop's CPU comfortable.
 
 ---
 
-## 17. Local process management
+## 12. Process management
 
-One `ProcessSupervisor` (`harness/supervisor.ts`) for all three adapters — the adapters never call `spawn` directly.
+One `ProcessSupervisor` (`harness/supervisor.ts`) for all three adapters — adapters never call `spawn` directly.
 
-- `spawn(cmd, args, { cwd, env, detached: true })` — `detached` gives a process group, so we can kill children (a CLI that spawned `npm test`) rather than orphaning them.
+- `spawn(cmd, args, { cwd, env, detached: true })` — `detached` gives a process group, so we kill children (a CLI that spawned `npm test`) rather than orphaning them.
 - **stdout** through a line-delimited NDJSON transform; malformed lines logged and skipped, never fatal.
-- **stderr** captured to `stderr.log` and tailed into the UI at `warn`.
-- **Env hygiene:** pass a curated env — `PATH`, `HOME`, `TERM`, plus explicit per-harness vars. Never forward the whole `process.env` (§30).
-- **Timeout:** `execution.timeout_seconds` → `SIGTERM` to `-pid` (the group) → 10s grace → `SIGKILL`.
+- **stderr** captured to `stderr.log`, tailed into the UI at `warn`.
+- **Env hygiene:** a curated env (`PATH`, `HOME`, `TERM`, plus explicit per-harness vars). Never spread `process.env` into a spawned coding agent.
+- **Timeout:** `execution.timeout_seconds` → `SIGTERM` to `-pid` → 10s grace → `SIGKILL`.
 - **Cancellation:** an `AbortController` per task; a run-level controller aborts all children.
-- **Backpressure:** cap in-memory events per task (ring buffer, e.g. 500) for the UI; the full stream always goes to `events.ndjson`.
+- **Backpressure:** cap in-memory events per task (ring buffer ~500) for the UI; the full stream always lands in `events.ndjson`.
 - **Crash safety:** on boot, any `running` task/run in the DB is marked `failed` with `interrupted_by_restart` — no zombie state after a laptop sleep.
 
 ---
 
-## 18. Git worktree / workspace strategy
+## 13. Git worktree strategy
 
-**Worktrees are the correct MVP choice.** Every candidate harness accepts an arbitrary working directory (`cwd`, `--cd`, `--add-dir`), a worktree is a real checkout so builds and tests work unmodified, creation is fast because the object store is shared, and removal is a single command. Cloning is slower and wastes disk; a shared working tree would let two writers stomp each other; container isolation is out of scope for a hackathon.
+**Worktrees are the correct MVP choice:** every harness accepts an arbitrary working directory, a worktree is a real checkout so builds and tests work unmodified, creation is fast (shared object store), and removal is one command. Cloning is slower and wastes disk; a shared tree lets two writers stomp each other; containers are out of scope.
 
-**Rules (deliberately conservative):**
-
-- Read-only tasks (`permissions.filesystem ∈ {none, read}`) run in the **main repo** with the harness in read-only mode. No worktree, no branch.
-- Each writing task gets a **dedicated worktree**:
+- Read-only tasks (`filesystem ∈ {none, read}`) run in the **main repo** with the harness in read-only mode. No worktree, no branch.
+- Each writing task gets a dedicated worktree:
   ```bash
   git worktree add -b agentplan/<runId>/<taskId> \
       "<repo>/.worktrees/<runId>/<taskId>" HEAD
   ```
-- **Preflight:** refuse to start a run if `git status --porcelain` is non-empty, unless the user explicitly ticks "I know, proceed" in the New Run screen. Surfaced as a blocking dialog, not a silent warning.
-- **After a writing task:** `git -C <wt> add -A && git -C <wt> diff --cached > patch.diff`, and optionally commit inside the worktree. **Never push. Never merge. Never rebase. Never resolve conflicts.**
-- **Downstream review tasks** get the diff *as text in their context packet* plus read access to the worktree — they do not need to merge anything.
-- **Cleanup:** worktrees are **kept** after a run (they're the deliverable). The Settings screen has an explicit "Remove worktrees for run X" action → `git worktree remove --force` + `git worktree prune`. Manual on purpose: auto-deleting a user's generated code is the kind of destructive default that ruins trust.
-- `.worktrees/` is added to the workspace's `.git/info/exclude` at registration, so we never dirty the user's `.gitignore`.
-
-**Post-hackathon (explicit non-goal now):** automatic integration, conflict resolution, stacked branches, PR creation.
+- **Preflight:** refuse to start if `git status --porcelain` is non-empty, unless the user explicitly ticks "I know, proceed" — a blocking dialog, not a silent warning.
+- **After a writing task:** `git -C <wt> add -A && git -C <wt> diff --cached > patch.diff`, optionally committing inside the worktree. **Never push, merge, rebase, or resolve conflicts.**
+- **Cleanup:** worktrees are **kept** after a run (they're the deliverable). Settings has an explicit "Remove worktrees for run X" → `git worktree remove --force` + `git worktree prune`. Manual on purpose: auto-deleting a user's generated code is the kind of destructive default that ruins trust.
+- `.worktrees/` is added to `.git/info/exclude` at registration, so we never dirty the user's `.gitignore`.
 
 ---
 
-## 19. Local persistence
+## 14. Persistence and data model
 
-**`node:sqlite`, built into Node 25 — verified working on this machine.** Chosen over `better-sqlite3` because it needs no native compile step; a `node-gyp` failure mid-hackathon is a real, avoidable risk. (It prints an `ExperimentalWarning`; suppress with `--no-warnings=ExperimentalWarning` in the dev script. If it misbehaves, `better-sqlite3` is a drop-in with nearly the same synchronous API — noted as the fallback.)
+**`node:sqlite`, built into Node 25 — verified working here.** Chosen over `better-sqlite3` because it needs no native compile step; a `node-gyp` failure mid-hackathon is a real, avoidable risk. (It prints an `ExperimentalWarning`; suppress with `--no-warnings=ExperimentalWarning`. If it misbehaves, `better-sqlite3` is a near-identical synchronous drop-in.) Chosen over JSON files because the Usage dashboard is fundamentally `GROUP BY model / workspace / run`; chosen over Postgres because local-first with zero ops is a requirement.
 
-Chosen over JSON files because the Usage dashboard is fundamentally `GROUP BY model / workspace / run` — aggregation is the whole feature. Chosen over Postgres/Supabase because local-first with zero ops is an explicit requirement.
-
-**Four separated concerns — the separation is a hard rule:**
+**Four separated concerns — a hard rule:**
 
 | Concern | Location | Contains secrets? |
 |---|---|---|
-| **1. Secrets** | OS environment + the CLIs' own credential stores (`~/.claude`, `~/.codex/auth.json`, `~/.gemini`) | Yes — and we never read or write them |
-| **2. App configuration** | `~/.agentplan/config.json` (0600) — workspaces, catalog overrides, EverOS URL, concurrency | No |
-| **3. Telemetry / run history** | `~/.agentplan/agentplan.db` | **Never** |
-| **4. Task artifacts** | `~/.agentplan/runs/<runId>/...` | Never intentionally; see §30 |
-
-Everything under `~/.agentplan/`, not in the user's repo, so the tool never pollutes the workspace it operates on.
-
-Migrations: a single `schema.sql` applied idempotently at boot with a `user_version` pragma check. No migration framework for the MVP.
-
----
-
-## 20. Secret management
-
-**The design goal is that this app holds no provider API keys at all**, and the local toolchain makes that achievable:
-
-- **Execution keys: not ours.** `claude`, `codex`, and `gemini` are each already authenticated on this machine via their own credential stores. We spawn them; they authenticate themselves. This is why no `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` is set in the environment — and it should stay that way.
-- **EverOS provider keys: EverOS's, not ours.** They live in EverOS's own `.env` (`EVEROS_LLM__API_KEY`, `EVEROS_EMBEDDING__API_KEY`, …), read by the EverOS server process. We only talk to `http://127.0.0.1:8000`.
-
-**Hard rules:**
-
-1. **Never `localStorage`, never `sessionStorage`, never a cookie, never in a bundled JS file.** The browser is untrusted; the SPA talks only to `localhost:8787`.
-2. **No secret is ever sent to the frontend.** The Settings API returns `{ configured: boolean, source: "env" | "cli-credential-store" | "missing" }` — a status, never a value.
-3. **No secret in SQLite, plans, artifacts, or logs.**
-4. If a secret is ever genuinely required (e.g. an EverOS Cloud key later), it goes in the process environment via a `.env` read by the *server only*, with `.env` in `.gitignore` and the file mode checked at boot. Never a DB column.
-5. Settings is a **detection and diagnostics screen** — "Claude Code: installed 2.1.224, authenticated ✓" — plus a "how to fix" link. It is not a key-entry form.
-
-**Why not OS keychain for the MVP:** it adds a native dependency and per-platform code for zero benefit, because we hold nothing worth storing. Documented as a post-hackathon step for the day a first-party key is genuinely needed.
-
----
-
-## 21. Usage / token / cost accounting
-
-**Normalization.** Each adapter maps its harness's fields into `NormalizedUsage` (§11). Traps handled explicitly:
-- Codex `turn.completed.usage` is **cumulative** → last-event-wins, not summed.
-- Gemini `stats.tokens.total` **includes** `thoughts` and `tool` → recompute rather than trust.
-- Claude Code cache fields are separate from `input_tokens` → keep `cachedInputTokens` distinct so cost math can price it differently later.
-
-**Cost resolution, in strict priority order** (`usage/cost.ts`):
-
-1. **Exact** — the harness returned dollars. Only Claude Code (`total_cost_usd`). → `cost_is_estimated = 0`.
-2. **Derived** — catalog has published per-MTok prices → `input/1e6 × in + output/1e6 × out`. → `cost_is_estimated = 1`.
-3. **Unknown** — no price (subscription-auth models with no published rate) → cost `null`, tokens still recorded. The UI shows "— (tokens only)", never `$0.00`. Showing zero would be a lie that flatters the savings number.
-
-**Every dollar figure in the UI carries a provenance badge**: `exact` / `est.` / `tokens only`. One shared `<Cost>` component enforces this — it cannot render a number without a provenance prop.
-
-**Aggregations** (plain SQL over `tasks`): per run, per model, per harness, per workspace, per day; agent count; model distribution; wall-clock duration; success/failure counts. Wall-clock run duration is `max(completed_at) − min(started_at)`, which is *less* than the sum of task durations when tasks ran in parallel — the dashboard shows both and labels them.
-
----
-
-## 22. Baseline-vs-actual cost methodology
-
-**The claim, stated precisely:**
-
-> **Baseline** — what this same run would have cost if *every LLM-driven task* had been executed by the planner-class frontier model, holding the observed token counts constant.
-> **Actual** — the sum of resolved per-task costs under the planner's assignments.
-> **Savings** — `(baseline − actual) / baseline`.
-
-```
-baseline_cost = Σ_tasks ( in_tokens/1e6 × frontier_in + out_tokens/1e6 × frontier_out )
-actual_cost   = Σ_tasks ( resolved cost per §21 )
-```
-
-**Assumptions, printed in the UI next to the number — not buried in a doc:**
-
-1. Token counts are held constant across models. A frontier model may use fewer or more tokens for the same task, so this is an approximation, not a measurement.
-2. The frontier reference is `claude-opus-5` at published API rates.
-3. Tasks whose actual cost is `tokens only` are priced at their catalog rate for the *actual* side where one exists; where none exists, they are **excluded from both sides** and the count of excluded tasks is displayed. Excluding from both sides is what keeps the ratio honest.
-4. Planning cost is included in `actual` (it is real, exact, and part of the approach) and in `baseline` (the planner is frontier by definition, so it is identical on both sides — it dilutes the savings percentage rather than inflating it, which is the conservative direction).
-
-**UI treatment:**
-
-```
-Baseline (all-frontier, estimated)   $1.84
-Actual routed plan cost              $0.42   ($0.11 exact · $0.31 est.)
-Savings                              77%
-⚠ Estimated. Token counts held constant across models. 1 task excluded (no published rate).
-```
-
-The `⚠` line is not optional chrome. A judge who asks "how do you know?" should find the answer already on screen.
-
-**Anti-goal:** never compare against a fabricated "what a human would have spent" or a made-up per-task frontier token count.
-
----
-
-## 23. EverMind / EverOS integration
-
-**Verified facts** (repo `EverMind-AI/EverOS`, Apache-2.0, Python, ~11.9k stars, active): local-first, Markdown is the source of truth, SQLite + LanceDB indexes, hybrid BM25 + vector retrieval, FastAPI HTTP server.
-
-**Setup (documented in the README, not invented):**
-```bash
-uv pip install everos          # Python 3.12+ — machine has 3.12.3 ✓
-everos init                    # writes ./.env
-everos server start            # http://127.0.0.1:8000
-curl http://127.0.0.1:8000/health          # → {"status":"ok"}
-```
-Requires an OpenRouter key (`EVEROS_LLM__API_KEY`, `EVEROS_MULTIMODAL__API_KEY`) and a DeepInfra key (`EVEROS_EMBEDDING__API_KEY`, `EVEROS_RERANK__API_KEY`), or any OpenAI-compatible endpoints via the `*__BASE_URL` fields. **This is a prerequisite to flag early** — without it only `everos demo` works, not add/search.
-
-**Endpoints used (v2; `/api/v1` is a legacy alias — write v2):**
-
-| Endpoint | Use |
-|---|---|
-| `GET /health` | Availability probe at boot and before each write |
-| `POST /api/v2/memory/add` | Write run outcome — `{session_id, app_id, project_id, messages[{sender_id, role, timestamp, content}]}` |
-| `POST /api/v2/memory/flush` | Force extraction so the memory is searchable immediately (essential for a live demo) |
-| `POST /api/v2/memory/search` | Retrieve prior memories — `{query, user_id \| agent_id, app_id, project_id, top_k, method:"hybrid"}` |
-
-**This is operational memory for the planner, not decorative chat memory.** The orthogonal retrieval axes map onto our domain almost exactly:
-
-| EverOS axis | Our meaning |
-|---|---|
-| `app_id` | `"agentplan"` (constant) |
-| `project_id` | workspace id — memory is per-repository |
-| `agent_id` | the agent role (`implementer`, `reviewer`, …) — enables role-scoped recall |
-| `session_id` | the run id |
-| `sender_id` | `"orchestrator"` |
-
-**Write-after-run** (`memory/write.ts`) — one message per completed task plus one run-level summary, each a factual sentence built from real telemetry:
-
-> "On workspace `acme-api` (TypeScript, Express, Vitest), a bounded test-writing task assigned to `gpt-5.6-sol` via the Codex harness completed successfully in 94s using 41.2k tokens. A read-only repository scan assigned to `gemini-2.5-flash` was sufficient and cost an estimated $0.004. The architecture task on `claude-opus-5` produced the design that the implementation followed without rework."
-
-**Read-before-plan** (`memory/read.ts`) — before building the planner prompt, `POST /memory/search` with a query derived from the goal + repo profile, `project_id` = workspace, `top_k` = 5. Hits are injected into the planner prompt under a `## Prior execution memory` heading, clearly framed as **advisory observations, not instructions** (a memory that says "use model X" must not override the catalog).
-
-**The demo moment this creates:** run the same goal twice on the same repo; the second plan visibly cites prior memory in `rationale_summary`. That is a concrete "learning that compounds" story rather than a logo on a slide.
-
-**Graceful degradation:** if `/health` fails, memory reads return `[]` and writes are appended to a local outbox (`~/.agentplan/everos-outbox.ndjson`) with a "Retry EverOS sync" button in Settings. **The product is fully usable with EverOS down.**
-
----
-
-## 24. Snowflake integration
-
-**Out of scope for the MVP, by the user's decision.** Not implemented, not stubbed with fake calls, not claimed in the UI.
-
-**What is done instead — keeping the door open at near-zero cost:** the `tasks` table is deliberately shaped as a flat, denormalized fact table matching the columns the brief listed (`run_id, task_id, workspace_id, harness, model, provider, input_tokens, output_tokens, cached_tokens, estimated_cost_usd, latency_ms, status, success, started_at, completed_at`), and carries a `synced_at TIMESTAMP NULL` column that nothing currently writes.
-
-Adding Snowflake later is therefore: `pnpm add snowflake-sdk` → a `SELECT ... WHERE synced_at IS NULL` → batched `INSERT` → `UPDATE synced_at`. Roughly 60 lines, no schema change. Auth would be key-pair (`authenticator: 'SNOWFLAKE_JWT'`, `privateKeyPath`), which is the recommended local-app method and avoids storing a password.
-
-Listed in §40 as the first post-hackathon extension.
-
----
-
-## 25. Frontend information architecture
-
-Six screens, one nav rail. Deliberately small.
-
-| Route | Purpose | Key elements |
-|---|---|---|
-| `/` **Dashboard** | Orientation | Active workspace, live run card, total spend + tokens, last 5 runs |
-| `/new` **New Run** | Start work | Workspace selector, goal textarea, optional budget, dirty-tree warning, **Create Plan** |
-| `/runs/:id/plan` **Plan View** | *The differentiator screen* | DAG + task cards, per-task model/harness/skills/deps/permissions/estimate/**rationale**, plan totals, **Start Run** |
-| `/runs/:id` **Execution** | Watch it work | Live agent cards, statuses, elapsed, tokens, cost, worktree path, event log |
-| `/usage` **Usage** | Economics | Cost by model, tokens by model, runs table, duration, success/fail, **baseline vs actual** |
-| `/settings` **Settings** | Configure | Workspaces, harness detection, model catalog toggles, **discovered skills grouped by source scope with their file paths**, EverOS status, worktree cleanup |
-
-Design language: dark, dense, monospace for identifiers, colour used **only** for status. Demo-legible at projector distance. Tailwind, no component library — a UI kit is a time sink at this size.
-
----
-
-## 26. Important UI components
-
-- **`<PlanGraph>`** — the one visual worth investing in. **Layered list-graph hybrid, not a physics graph.** Tasks bucketed by topological depth into columns; dependency edges drawn as SVG paths between card anchors. Deterministic, readable, no layout library, ~150 lines. A force-directed graph is the classic hackathon time sink; explicitly avoided.
-- **`<AgentCard>`** — one worker: harness badge · model chip · role · status pill · elapsed · in/out tokens · cost with provenance badge · worktree path · dependency chips. Used identically in Plan View (planned state) and Execution (live state).
-- **`<Cost>`** — renders money. **Requires** a `provenance` prop (`exact` | `estimated` | `unknown`); renders `— tokens only` for unknown. Makes honest labelling structurally unavoidable.
-- **`<EventLog>`** — virtualized, filterable by level, auto-scroll with pause-on-scroll-up.
-- **`<UsageBars>`** — plain CSS-grid horizontal bars for cost/tokens by model. No charting dependency.
-- **`<BaselinePanel>`** — baseline / actual / savings % + the assumptions block (§22).
-- **`<HarnessStatus>`** — per-CLI installed/version/authenticated row for Settings.
-
----
-
-## 27. Backend / API / event-streaming design
-
-REST for commands and reads; **SSE** for live updates. SSE over WebSockets: unidirectional server→client is all we need, it's plain HTTP, it auto-reconnects natively, and it survives a Vite proxy without extra config.
-
-```
-POST   /api/workspaces                 register { path } → validate git repo, profile it
-GET    /api/workspaces
-DELETE /api/workspaces/:id
-
-GET    /api/harnesses                  detection + auth status
-GET    /api/models                     catalog (with availability)
-PATCH  /api/models/:id                 { enabled } and price overrides
-GET    /api/skills
-
-POST   /api/runs                       { workspaceId, goal, budget? } → creates run, plans async
-GET    /api/runs                       list + aggregates
-GET    /api/runs/:id                   run + plan + tasks + usage
-POST   /api/runs/:id/start             validated plan → queued → scheduler
-POST   /api/runs/:id/cancel            abort all children
-GET    /api/runs/:id/events            text/event-stream  ← live
-GET    /api/runs/:id/tasks/:taskId/artifact/:name   raw artifact
-
-GET    /api/usage/summary              ?groupBy=model|harness|workspace|run|day
-GET    /api/usage/baseline/:runId      baseline vs actual + assumptions
-
-GET    /api/memory/status              EverOS health
-POST   /api/memory/retry               drain the outbox
-```
-
-**Event bus:** a single in-process `EventEmitter`; SSE handlers subscribe by `runId`. Each SSE message is `{ type, runId, taskId?, seq, ts, payload }` with a monotonic `seq` so a reconnecting client can request a replay from `~/.agentplan/runs/<id>/events.ndjson` via `Last-Event-ID`. Types: `run.status`, `task.status`, `task.log`, `task.tool`, `task.usage`, `task.artifact`, `plan.ready`, `plan.invalid`.
-
-**Why a single process:** the child-process registry, the SSE bus, and the scheduler must share memory. Splitting them across serverless-style handlers would require external coordination for no benefit in a local app.
-
----
-
-## 28. Data model
-
-`~/.agentplan/agentplan.db` (SQLite). Abbreviated DDL:
+| **Secrets** | OS env + the CLIs' own stores (`~/.claude`, `~/.codex/auth.json`, `~/.gemini`) | Yes — and we never read or write them |
+| **App configuration** | `~/.agentplan/config.json` (0600) — workspaces, catalog overrides, EverOS URL, concurrency | No |
+| **Telemetry / run history** | `~/.agentplan/agentplan.db` | **Never** |
+| **Task artifacts** | `~/.agentplan/runs/<runId>/...` | Never intentionally (§16 redaction) |
+
+Everything lives under `~/.agentplan/`, never in the user's repo. Migrations: one `schema.sql` applied idempotently at boot behind a `user_version` pragma check — no migration framework.
 
 ```sql
 CREATE TABLE workspaces (
@@ -971,7 +586,7 @@ CREATE TABLE workspaces (
 
 CREATE TABLE runs (
   id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-  goal TEXT NOT NULL, status TEXT NOT NULL,             -- planning|planned|running|completed|failed|cancelled
+  goal TEXT NOT NULL, status TEXT NOT NULL,   -- planning|planned|running|completed|failed|cancelled
   plan_json TEXT, plan_valid INTEGER, plan_errors_json TEXT,
   budget_usd REAL,
   planner_model TEXT, planner_cost_usd REAL, planner_input_tokens INTEGER,
@@ -979,7 +594,7 @@ CREATE TABLE runs (
   concurrency_limit INTEGER NOT NULL DEFAULT 3,
   created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT);
 
--- Flat fact table: one row per task. Snowflake-shaped on purpose (§24).
+-- Flat fact table: one row per task. Snowflake-shaped on purpose (§16).
 CREATE TABLE tasks (
   id TEXT PRIMARY KEY,                       -- <runId>:<taskId>
   run_id TEXT NOT NULL REFERENCES runs(id), task_key TEXT NOT NULL,
@@ -1008,7 +623,7 @@ CREATE TABLE model_catalog (
   reliability_notes TEXT, is_local INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1);
 
 -- Discovered-skill INDEX, not skill storage. Instructions stay in their source
--- files (§10) and are read at packet-build time. Deliberately no `model` column.
+-- files (§8) and are read at packet-build time. Deliberately no `model` column.
 CREATE TABLE skills (
   id TEXT NOT NULL, workspace_id TEXT,          -- NULL = user-level or builtin
   name TEXT NOT NULL, description TEXT NOT NULL,
@@ -1033,22 +648,178 @@ CREATE INDEX idx_runs_ws     ON runs(workspace_id);
 
 ---
 
-## 29. Error handling and cancellation
+## 15. Security and secrets
+
+**The design goal is that this app holds no provider API keys at all**, and the toolchain makes that achievable: `claude`, `codex`, and `gemini` authenticate themselves from their own credential stores, and EverOS's provider keys live in EverOS's own `.env` (`EVEROS_LLM__API_KEY`, `EVEROS_EMBEDDING__API_KEY`, …), read by its server process. We only talk to `http://127.0.0.1:8000`.
+
+1. **Bind to `127.0.0.1` only.** Never `0.0.0.0` — a local orchestrator that spawns shell-capable agents must not be reachable from the LAN. **SSE has no auth**, acceptable only because of this rule; documented as a constraint, not an oversight.
+2. **CORS restricted** to the Vite dev origin; in production the SPA is served same-origin.
+3. **No secret reaches the browser.** Never `localStorage`/`sessionStorage`/a cookie/a bundled JS file. Settings returns `{ configured: boolean, source: "env" | "cli-credential-store" | "missing" }` — a status, never a value. Settings is a **detection and diagnostics screen** ("Claude Code: installed 2.1.224, authenticated ✓" plus a how-to-fix link), not a key-entry form.
+4. **No secret in SQLite, plans, artifacts, or logs.** If a first-party key is ever genuinely required, it goes in the server process's environment via a gitignored `.env` with its file mode checked at boot — never a DB column. (OS keychain is deliberately deferred: a native dependency and per-platform code for zero benefit while we hold nothing worth storing.)
+5. **Env allow-list for children** (§12).
+6. **Workspace path validation.** Registration requires an existing directory containing `.git`; the resolved realpath is stored. Reject paths escaping the registered root when constructing worktree paths.
+7. **`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, and `--yolo` are never emitted.** A unit test asserts no adapter can produce those strings.
+8. **Least privilege per task.** `permissions.filesystem` maps to the harness's own sandbox flag, so read-only tasks are read-only *at the harness level*, not by convention. Shell allow-lists pass through as `Bash(cmd *)` rules where supported, rather than blanket bash access.
+9. **No chain-of-thought in logs** (§9 parsing notes). Logs contain operational events, tool names/results, and summaries. Reasoning **tokens** are still counted for cost — counting is not exposing.
+10. **Artifact redaction pass.** Before writing `output.md`/`summary.json`, regex-scan for common key shapes (`sk-`, `ghp_`, `AKIA`, `-----BEGIN ... PRIVATE KEY-----`) → `[REDACTED]`. Cheap insurance against an agent echoing a `.env` it read.
+
+---
+
+## 16. Usage, cost, and the baseline claim
+
+**Normalization.** Each adapter maps its fields into `NormalizedUsage` (§9), handling the three traps documented there: Codex cumulative usage, Gemini's inclusive `total`, and Claude's separate cache fields (kept distinct so cost math can price them differently later).
+
+**Cost resolution, in strict priority order** (`usage/cost.ts`):
+
+1. **Exact** — the harness returned dollars. Only Claude Code. → `cost_is_estimated = 0`.
+2. **Derived** — catalog has published per-MTok prices → `input/1e6 × in + output/1e6 × out`. → `cost_is_estimated = 1`.
+3. **Unknown** — no published rate → cost `null`, tokens still recorded. The UI shows "— (tokens only)", never `$0.00`. Showing zero would be a lie that flatters the savings number.
+
+**Every dollar figure in the UI carries a provenance badge** (`exact` / `est.` / `tokens only`), enforced by one shared `<Cost>` component that cannot render a number without a provenance prop.
+
+**Aggregations** (plain SQL over `tasks`): per run, model, harness, workspace, day; agent count; model distribution; wall-clock duration; success/failure counts. Wall-clock run duration is `max(completed_at) − min(started_at)`, which is *less* than the sum of task durations under parallelism — the dashboard shows both, labelled.
+
+**The baseline claim, stated precisely:**
+
+> **Baseline** — what this same run would have cost if *every LLM-driven task* had been executed by the planner-class frontier model, holding the observed token counts constant.
+> **Actual** — the sum of resolved per-task costs.
+> **Savings** — `(baseline − actual) / baseline`.
+
+```
+baseline_cost = Σ_tasks ( in_tokens/1e6 × frontier_in + out_tokens/1e6 × frontier_out )
+actual_cost   = Σ_tasks ( resolved cost per the priority order above )
+```
+
+**Assumptions, printed in the UI next to the number:**
+
+1. Token counts are held constant across models. A frontier model may use fewer or more tokens for the same task, so this is an approximation, not a measurement.
+2. The frontier reference is `claude-opus-5` at published API rates.
+3. `tokens only` tasks are priced at their catalog rate on the actual side where one exists; where none exists they are **excluded from both sides**, with the excluded count displayed. Excluding from both is what keeps the ratio honest.
+4. Planning cost is included in both sides (it is real and exact, and the planner is frontier by definition), so it dilutes the savings percentage rather than inflating it — the conservative direction.
+
+```
+Baseline (all-frontier, estimated)   $1.84
+Actual routed plan cost              $0.42   ($0.11 exact · $0.31 est.)
+Savings                              77%
+⚠ Estimated. Token counts held constant across models. 1 task excluded (no published rate).
+```
+
+The `⚠` line is not optional chrome — a judge who asks "how do you know?" should find the answer already on screen. **Anti-goal:** never compare against a fabricated "what a human would have spent" or a made-up per-task frontier token count.
+
+**Snowflake (out of MVP).** Not implemented, not stubbed with fake calls, not claimed in the UI. What is done instead, at near-zero cost: the `tasks` table is a flat denormalized fact table matching the columns the brief listed, carrying a `synced_at` column nothing currently writes. Adding Snowflake later is `pnpm add snowflake-sdk` → `SELECT ... WHERE synced_at IS NULL` → batched `INSERT` → `UPDATE synced_at`. ~60 lines, no schema change; auth would be key-pair (`authenticator: 'SNOWFLAKE_JWT'`, `privateKeyPath`), avoiding a stored password.
+
+---
+
+## 17. EverMind / EverOS integration
+
+**Verified facts** (repo `EverMind-AI/EverOS`, Apache-2.0, Python, ~11.9k stars, active): local-first, Markdown is the source of truth, SQLite + LanceDB indexes, hybrid BM25 + vector retrieval, FastAPI HTTP server.
+
+```bash
+uv pip install everos          # Python 3.12+ — machine has 3.12.3 ✓
+everos init                    # writes ./.env
+everos server start            # http://127.0.0.1:8000
+curl http://127.0.0.1:8000/health          # → {"status":"ok"}
+```
+
+Requires an OpenRouter key (`EVEROS_LLM__API_KEY`, `EVEROS_MULTIMODAL__API_KEY`) and a DeepInfra key (`EVEROS_EMBEDDING__API_KEY`, `EVEROS_RERANK__API_KEY`), or any OpenAI-compatible endpoints via `*__BASE_URL`. **Flag this prerequisite early** — without it only `everos demo` works, not add/search.
+
+**Endpoints used** (v2; `/api/v1` is a legacy alias):
+
+| Endpoint | Use |
+|---|---|
+| `GET /health` | Availability probe at boot and before each write |
+| `POST /api/v2/memory/add` | Write run outcome — `{session_id, app_id, project_id, messages[{sender_id, role, timestamp, content}]}` |
+| `POST /api/v2/memory/flush` | Force extraction so memory is searchable immediately (essential for a live demo) |
+| `POST /api/v2/memory/search` | Retrieve — `{query, user_id \| agent_id, app_id, project_id, top_k, method:"hybrid"}` |
+
+**This is operational memory for the planner, not decorative chat memory.** The retrieval axes map onto our domain almost exactly: `app_id` = `"agentplan"`, `project_id` = workspace id (memory is per-repository), `agent_id` = agent role (enables role-scoped recall), `session_id` = run id, `sender_id` = `"orchestrator"`.
+
+**Write-after-run** (`memory/write.ts`) — one message per completed task plus a run-level summary, each a factual sentence built from real telemetry:
+
+> "On workspace `acme-api` (TypeScript, Express, Vitest), a bounded test-writing task assigned to `gpt-5.6-sol` via the Codex harness completed successfully in 94s using 41.2k tokens. A read-only repository scan assigned to `gemini-2.5-flash` was sufficient and cost an estimated $0.004. The architecture task on `claude-opus-5` produced the design that the implementation followed without rework."
+
+**Read-before-plan** (`memory/read.ts`) — before building the planner prompt, search with a query derived from goal + repo profile, `project_id` = workspace, `top_k` = 5. Hits are injected under `## Prior execution memory`, framed as **advisory observations, not instructions** (a memory saying "use model X" must not override the catalog).
+
+**The demo moment:** run the same goal twice on the same repo and the second plan visibly cites prior memory in `rationale_summary` — a concrete "learning that compounds" story rather than a logo on a slide.
+
+**Graceful degradation:** if `/health` fails, reads return `[]` and writes append to `~/.agentplan/everos-outbox.ndjson` with a "Retry EverOS sync" button in Settings. **The product is fully usable with EverOS down.**
+
+---
+
+## 18. Frontend
+
+Six screens, one nav rail. Dark, dense, monospace for identifiers, colour used **only** for status, legible at projector distance. Tailwind, no component library — a UI kit is a time sink at this size.
+
+| Route | Purpose | Key elements |
+|---|---|---|
+| `/` **Dashboard** | Orientation | Active workspace, live run card, total spend + tokens, last 5 runs |
+| `/new` **New Run** | Start work | Workspace selector, goal textarea, optional budget, dirty-tree warning, **Create Plan** |
+| `/runs/:id/plan` **Plan View** | *The differentiator screen* | DAG + task cards with model/harness/skills/deps/permissions/estimate/**rationale**, plan totals, **Start Run** |
+| `/runs/:id` **Execution** | Watch it work | Live agent cards, statuses, elapsed, tokens, cost, worktree path, event log |
+| `/usage` **Usage** | Economics | Cost and tokens by model, runs table, duration, success/fail, **baseline vs actual** |
+| `/settings` **Settings** | Configure | Workspaces, harness detection, catalog toggles, **discovered skills grouped by source scope with file paths**, EverOS status, worktree cleanup |
+
+Components worth naming:
+
+- **`<PlanGraph>`** — the one visual worth investing in. **Layered list-graph hybrid, not physics.** Tasks bucketed by topological depth into columns; dependency edges as SVG paths between card anchors. Deterministic, no layout library, ~150 lines. A force-directed graph is the classic hackathon time sink; explicitly avoided.
+- **`<AgentCard>`** — harness badge · model chip · role · status pill · elapsed · in/out tokens · cost with provenance · worktree path · dependency chips. Identical in Plan View (planned) and Execution (live).
+- **`<Cost>`** — **requires** a `provenance` prop; renders `— tokens only` for unknown. Makes honest labelling structurally unavoidable.
+- **`<EventLog>`** — virtualized, filterable by level, auto-scroll with pause-on-scroll-up.
+- **`<UsageBars>`** — CSS-grid horizontal bars. No charting dependency.
+- **`<BaselinePanel>`** — baseline / actual / savings % + the assumptions block (§16).
+- **`<HarnessStatus>`** — per-CLI installed/version/authenticated row.
+
+---
+
+## 19. API and event streaming
+
+REST for commands and reads; **SSE** for live updates — unidirectional is all we need, it's plain HTTP, it auto-reconnects natively, and it survives a Vite proxy without extra config.
+
+```
+POST   /api/workspaces                 register { path } → validate git repo, profile it
+GET    /api/workspaces
+DELETE /api/workspaces/:id
+
+GET    /api/harnesses                  detection + auth status
+GET    /api/models                     catalog (with availability)
+PATCH  /api/models/:id                 { enabled } and price overrides
+GET    /api/skills
+
+POST   /api/runs                       { workspaceId, goal, budget? } → creates run, plans async
+GET    /api/runs                       list + aggregates
+GET    /api/runs/:id                   run + plan + tasks + usage
+POST   /api/runs/:id/start             validated plan → queued → scheduler
+POST   /api/runs/:id/cancel            abort all children
+GET    /api/runs/:id/events            text/event-stream  ← live
+GET    /api/runs/:id/tasks/:taskId/artifact/:name   raw artifact
+
+GET    /api/usage/summary              ?groupBy=model|harness|workspace|run|day
+GET    /api/usage/baseline/:runId      baseline vs actual + assumptions
+
+GET    /api/memory/status              EverOS health
+POST   /api/memory/retry               drain the outbox
+```
+
+**Event bus:** one in-process `EventEmitter`; SSE handlers subscribe by `runId`. Messages are `{ type, runId, taskId?, seq, ts, payload }` with a monotonic `seq`, so a reconnecting client replays from `events.ndjson` via `Last-Event-ID`. Types: `run.status`, `task.status`, `task.log`, `task.tool`, `task.usage`, `task.artifact`, `plan.ready`, `plan.invalid`.
+
+---
+
+## 20. Error handling and cancellation
 
 | Failure | Handling |
 |---|---|
-| Planner returns invalid JSON / schema mismatch | Store raw stdout; surface field-level errors; **one** automatic re-plan with errors appended; then stop |
+| Planner returns invalid JSON / schema mismatch | Store raw stdout; surface field-level errors; **one** automatic re-plan; then stop |
 | Planner invents a model/harness/skill | Rejected at gate 2; the invalid identifier is named in the UI |
 | Plan has a dependency cycle | Rejected at gate 3 with the cycle path printed |
 | Plan over budget | Returned as `over_budget`; user accepts or re-plans. Never silently truncated |
-| Harness binary missing / unauthenticated | Detected at boot; those models filtered from the catalog so the planner can't pick them |
+| Harness missing / unauthenticated | Detected at boot; its models filtered from the catalog so the planner can't pick them |
 | Worker non-zero exit | Task `failed`; stderr captured; dependents → `blocked`; independent branches continue |
-| Worker timeout | SIGTERM to the process group → 10s → SIGKILL; task `failed` with `timeout` |
-| Worker emits no summary block | Fall back to the final assistant message; `key_findings: []`. Degraded, not fatal |
+| Worker timeout | SIGTERM to the group → 10s → SIGKILL; task `failed` with `timeout` |
+| Worker emits no summary block | Fall back to the final assistant message; `key_findings: []` |
 | Dirty working tree at run start | Blocking dialog; explicit user override required |
 | Worktree create fails (branch exists) | Suffix the branch name; retry once; then fail the task with a clear message |
 | EverOS unreachable | Reads → `[]`; writes → outbox; banner in Settings. Run unaffected |
-| SSE client disconnects | Server keeps running; client reconnects and replays from `Last-Event-ID` |
+| SSE client disconnects | Server keeps running; client replays from `Last-Event-ID` |
 | Server restart mid-run | Boot marks orphaned `running` rows `failed` (`interrupted_by_restart`); worktrees preserved |
 | User cancels | Run-level `AbortController` → SIGTERM to every group → tasks `cancelled` → worktrees preserved |
 
@@ -1056,306 +827,123 @@ CREATE INDEX idx_runs_ws     ON runs(workspace_id);
 
 ---
 
-## 30. Security considerations
-
-1. **Bind to `127.0.0.1` only.** Never `0.0.0.0`. A local orchestrator that spawns shell-capable agents must not be reachable from the LAN.
-2. **CORS restricted** to the Vite dev origin; in production the SPA is served same-origin from the Node process.
-3. **No secrets in the browser** (§20). Settings returns booleans.
-4. **Env allow-list for children.** Curated env only; never spread `process.env` into a spawned coding agent.
-5. **Workspace path validation.** Registration requires an existing directory containing `.git`; the resolved realpath is stored. Reject paths escaping the registered root when constructing worktree paths.
-6. **`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, and `--yolo` are never emitted.** Add a unit test asserting no adapter can produce those strings — a guardrail that survives future edits.
-7. **Least privilege per task.** `permissions.filesystem` maps to the harness's own sandbox flag (`--sandbox read-only`, `--permission-mode dontAsk`, `--approval-mode default`). Read-only tasks are read-only *at the harness level*, not by convention.
-8. **Shell allow-lists** are passed through as `Bash(cmd *)` rules where the harness supports them, rather than blanket bash access.
-9. **No chain-of-thought in logs.** Claude `thinking` blocks dropped; Codex `item.type === "reasoning"` filtered; Gemini exposes only a `thoughts` token *count*. Logs contain operational events, tool names/results, and summaries. Reasoning **tokens** are still counted for cost — counting is not exposing.
-10. **Artifact redaction pass.** Before writing `output.md` / `summary.json`, run a regex scan for common key shapes (`sk-`, `ghp_`, `AKIA`, `-----BEGIN ... PRIVATE KEY-----`) and replace with `[REDACTED]`. Cheap insurance against an agent echoing a `.env` it read.
-11. **SSE has no auth** — acceptable only because of rule 1. Documented as a constraint, not an oversight.
-
----
-
-## 31. Real vs. mocked in the hackathon MVP
-
-| Component | Status |
-|---|---|
-| Workspace registration + git profiling | **Real** |
-| Skill discovery from `.agents/skills`, `.claude/skills`, user dirs | **Real** |
-| Planner (`claude -p --json-schema`) | **Real** |
-| `plan.json` as an immutable persisted artifact | **Real** |
-| Plan validation against the catalog + skill registry | **Real** |
-| DAG scheduler + parallel execution | **Real** |
-| Claude Code adapter | **Real** |
-| Codex adapter | **Real** |
-| Gemini adapter | **Real** |
-| Git worktree isolation | **Real** |
-| SQLite persistence + run history | **Real** |
-| SSE live streaming | **Real** |
-| Token accounting | **Real** (parsed from each harness) |
-| Cost — Claude Code | **Real, exact** (`total_cost_usd`) |
-| Cost — Codex / Gemini | **Estimated** from a curated catalog; labelled in the UI |
-| Baseline vs actual | **Real arithmetic** over real tokens; assumptions displayed |
-| EverOS write + read | **Real** (needs EverOS running + provider keys) |
-| Model catalog capability tags | **Curated by us** — presented as our tags, not benchmarks |
-| Snowflake | **Not built** (user decision) — schema is sync-ready |
-| Escalation / replanning | **Schema field only**, not executed |
-| Auth / multi-user | **Not built** — non-goal |
-
-Nothing is fake-but-presented-as-real. Anything estimated says so on screen.
-
----
-
-## 32. Exact MVP scope
+## 21. MVP scope
 
 1. Register/select a local git workspace.
-2. Detect installed + authenticated harnesses; seed the model catalog; **discover skills** from the workspace (`.agents/skills`, `.claude/skills`) and user-level directories, with built-ins as fallback.
+2. Detect installed + authenticated harnesses; seed the catalog; **discover skills** from workspace and user directories with built-ins as fallback.
 3. Enter an engineering goal (+ optional budget).
 4. Planner inspects the real repo read-only and **jointly decides decomposition and per-task model/harness assignment** in one pass.
-5. Plan validated against schema, model catalog, skill registry, graph, permissions, budget — then frozen as an immutable `plan.json`.
+5. Plan validated against schema, catalog, skill registry, graph, permissions, budget — then frozen as an immutable `plan.json`.
 6. Plan View shows every agent with model, harness, skills, deps, permissions, estimate, and rationale — **before execution**.
 7. Execute 3–4 tasks across **at least two** harness/model configurations, in parallel where the DAG allows.
 8. Stream status, tool events, tokens, and cost live over SSE.
-9. Writing tasks run in dedicated git worktrees; a diff artifact is produced.
+9. Writing tasks run in dedicated worktrees; a diff artifact is produced.
 10. Persist runs/plans/tasks/usage to SQLite; history survives a restart.
 11. Write execution memory to EverOS; retrieve it on the next plan for the same repo.
-12. Usage screen: cost/tokens by model, run history, and baseline vs actual with assumptions.
+12. Usage screen: cost/tokens by model, run history, baseline vs actual with assumptions.
+
+**Everything above is real** — real CLIs, real tokens, real DAG execution, real worktrees, real arithmetic. The only qualifications: Codex/Gemini **cost** is estimated from a curated catalog and labelled in the UI; capability tags are **curated by us**, presented as our tags not benchmarks; Snowflake is **not built** (schema sync-ready); escalation/replanning is a **schema field only**. Nothing is fake-but-presented-as-real.
+
+**Explicit non-goals:** hosted/multi-user SaaS, auth, RBAC · a model-routing gateway · reimplementing any agent's inner loop · automatic merge/rebase/conflict resolution · runtime replanning or escalation · container/VM sandboxing beyond each harness's own flags · benchmark scores for models · **skills carrying a model or harness** (structurally prohibited, §8) · **an app-owned skill format** (we read `.agents/skills/` and `.claude/skills/` as they are) · **native subagents as the execution unit** (§9) · mutating a plan after validation · chain-of-thought display · presenting estimated cost as exact · Snowflake (per user decision) · Windows (macOS/Linux; POSIX process groups assumed).
 
 ---
 
-## 33. Ordered implementation phases
+## 22. Implementation phases
 
-Each phase ends in something runnable.
+Each phase ends in something runnable. Build strictly in order — this order *is* the priority order, and phases 0–8 constitute a complete, honest, demoable submission (~14.5 h cumulative). Per-phase tests are summarized here; the full testing rules are §23.
 
-### Phase 0 — Scaffold *(~45 min)*
-**Objective:** an empty app that boots.
-**Files:** ~~`plan.md`~~ (done) · `package.json` (pnpm workspaces) · `pnpm-workspace.yaml` · `tsconfig.base.json` · `.gitignore` · `packages/core/{package.json,src/index.ts}` · `server/{package.json,src/index.ts}` · `web/` (Vite React TS scaffold) · `vitest.config.ts`
-**Deps:** `hono`, `@hono/node-server`, `zod`, `zod-to-json-schema`, `nanoid`, `tsx`, `typescript`, `vitest`, `react`, `react-dom`, `react-router-dom`, `vite`, `@vitejs/plugin-react`, `tailwindcss`
-**APIs:** `GET /api/health`
-**Tests:** health returns 200.
-**Done when:** `pnpm dev` serves `:8787` and `:5173` with the proxy working.
+**Step 0 — Live smoke test first *(30 min)*.** Confirm all three CLIs' real output shapes and capture fixtures **before writing any parser** (see Verification). Everything downstream is built on these schemas.
 
-### Phase 1 — Persistence + workspaces *(~1 h)*
-**Objective:** register a repo and profile it.
-**Files:** `server/src/db/{schema.sql,index.ts}` · `server/src/workspace/{register.ts,profile.ts,git.ts}` · `server/src/http/workspaces.ts` · `web/src/pages/Settings.tsx`
-**Structures:** `workspaces`, `runs`, `tasks`, `model_catalog`, `skills`, `memory_outbox`.
-**APIs:** `POST/GET/DELETE /api/workspaces`
-**Tests:** schema applies idempotently; profiling this repo yields correct language/PM/framework; non-git path rejected.
-**Done when:** a repo is registered and its profile renders in Settings.
+| Phase | Time | Files | Done when |
+|---|---|---|---|
+| **0 · Scaffold** | 45 min | `package.json` (pnpm workspaces) · `pnpm-workspace.yaml` · `tsconfig.base.json` · `.gitignore` · `packages/core/` · `server/` · `web/` (Vite React TS) · `vitest.config.ts` | `pnpm dev` serves `:8787` + `:5173` with the proxy working; `GET /api/health` returns 200 |
+| **1 · Persistence + workspaces** | 1 h | `db/{schema.sql,index.ts}` · `workspace/{register,profile,git}.ts` · `http/workspaces.ts` · `pages/Settings.tsx` | A repo is registered and its profile renders. *Tests:* schema idempotent; profiling yields correct language/PM/framework; non-git path rejected |
+| **2 · Catalog + skills + detection** | 1.5 h | `catalog/{seed,index}.ts` · `skills/{discover,normalize,registry,resolve}.ts` + `builtin/*.md` · `harness/detect.ts` · `http/{models,skills,harnesses}.ts` · `HarnessStatus.tsx` | Settings lists discovered skills grouped by scope with source paths, and this machine's `~/.claude/skills/*` appear without being copied anywhere |
+| **3 · Plan schema + planner** *(the core)* | 2 h | `packages/core/src/plan.ts` · `planner/{prompt,run,validate}.ts` · `http/runs.ts` · `pages/NewRun.tsx` | A real goal against a real repo returns a schema-valid plan plus its exact planner cost |
+| **4 · Plan View** | 1.5 h | `pages/PlanView.tsx` · `components/{PlanGraph,AgentCard,Cost}.tsx` | The DAG renders model, harness, skills, deps, permissions, estimate, and rationale per task, plus totals and **Start Run** |
+| **5 · Adapters + supervisor** | 2.5 h | `harness/{types,supervisor,claude,codex,gemini,index}.ts` · `usage/normalize.ts` | Each adapter runs a trivial read-only task in a scratch repo and reports correct tokens |
+| **6 · Worktrees + context packets** | 1.5 h | `workspace/worktree.ts` · `context/{build,render,summary}.ts` · artifact endpoint | A writing task produces `patch.diff` in an isolated worktree and a downstream task receives its summary |
+| **7 · Scheduler + SSE** | 2 h | `scheduler/scheduler.ts` · `bus/index.ts` · `http/events.ts` · `pages/Execution.tsx` · `hooks/useRunEvents.ts` | A 4-task plan executes with visible parallelism and live updates |
+| **8 · Usage + baseline** | 1.5 h | `usage/{cost,aggregate,baseline}.ts` · `http/usage.ts` · `pages/Usage.tsx` · `components/{UsageBars,BaselinePanel}.tsx` | Usage shows cost/tokens by model and baseline vs actual with the assumptions block. Track 1 requires this |
 
-### Phase 2 — Catalog, skill discovery, harness detection *(~1.5 h)*
-**Objective:** the planner's option space is real *and sourced from the user's own machine*.
-**Files:** `server/src/catalog/{seed.ts,index.ts}` · `server/src/skills/{discover,normalize,registry,resolve}.ts` + `builtin/*.md` · `server/src/harness/detect.ts` · `server/src/http/{models,skills,harnesses}.ts` · `web/src/components/HarnessStatus.tsx`
-**APIs:** `GET /api/harnesses`, `GET/PATCH /api/models`, `GET /api/skills?workspaceId=`
-**Tests:** detection handles a missing binary; unavailable harness ⇒ its models excluded; **skill discovery across all five locations with precedence resolution**; a workspace skill shadows a same-id built-in; malformed front-matter is skipped with a warning not a throw; **a skill file declaring `model:` has that key rejected**; `mtime` change triggers a re-read.
-**Done when:** Settings lists discovered skills grouped by scope with their source paths, and this machine's `~/.claude/skills/*` show up without being copied anywhere.
+**Should have — materially better submission:**
 
-### Phase 3 — Plan schema + planner *(~2 h — the core)*
-**Objective:** a goal produces a validated DAG.
-**Files:** `packages/core/src/plan.ts` (Zod) · `server/src/planner/{prompt.ts,run.ts,validate.ts}` · `server/src/http/runs.ts` · `web/src/pages/NewRun.tsx`
-**APIs:** `POST /api/runs`, `GET /api/runs/:id`
-**Tests (highest value in the project):** Zod round-trip; cycle detection; unknown model/harness/skill rejected; `context_from ⊄ dependencies` rejected; write-permission-without-worktree rejected; budget overrun flagged. **Use a checked-in fixture plan so these run without spending money.**
-**Done when:** a real goal against a real repo returns a schema-valid plan and its exact planner cost.
+9. **EverOS memory** *(1.5 h)* — `memory/{client,write,read,outbox}.ts` · `http/memory.ts` · Settings panel. Done when a second run on the same repo cites prior memory in `rationale_summary`. The sponsor requirement and the strongest narrative beat — promote above Phase 8 if EverOS keys are confirmed working early.
+10. **Third harness adapter** (Gemini) *(45 min)* — the plan visibly spans three providers.
+11. **`<PlanGraph>` upgrade** from list to layered DAG with edges *(45 min)*.
+12. **Dashboard + run history** *(45 min)*.
+13. **Cancellation + restart recovery** *(45 min)*.
+14. **Demo polish** *(1 h)* — seed script for a demo repo, empty/error states, README with the demo script, `demo:reset`.
 
-### Phase 4 — Plan View *(~1.5 h)*
-**Objective:** the differentiator is visible.
-**Files:** `web/src/pages/PlanView.tsx` · `web/src/components/{PlanGraph,AgentCard,Cost}.tsx`
-**Done when:** the DAG renders with model, harness, skills, deps, permissions, estimate, and rationale per task, plus plan totals and a **Start Run** button.
+**Cut if time is short, in this order:** Dashboard (Usage covers it) → DAG edges (an indented dependency-grouped list reads fine at distance) → third harness (two already prove heterogeneous assignment) → catalog editing UI (seed-only) → in-app artifact viewer (open files in an editor) → outbox retry UI (log-only) → redaction pass (keep the demo repo secret-free) → restart recovery (don't kill the server during the demo) → escalation/replanning/plan diffing/merge assistance (already non-goals).
 
-### Phase 5 — Harness adapters + supervisor *(~2.5 h)*
-**Objective:** run one task through each CLI.
-**Files:** `server/src/harness/{types.ts,supervisor.ts,claude.ts,codex.ts,gemini.ts,index.ts}` · `server/src/usage/normalize.ts`
-**Tests:** parse checked-in stdout fixtures per harness → expected `NormalizedUsage`; Codex cumulative-usage handled as last-wins; Gemini `total` recomputed; no adapter can emit a dangerous flag.
-**Done when:** each adapter runs a trivial read-only task in a scratch repo and reports correct tokens.
+**The one-line fallback if everything slips:** an immutable `plan.json` that visibly assigns **different models on different harnesses** to different work units — each with selected skills and a written rationale — then executes across at least two harnesses as separate processes, with a per-model cost breakdown. Ship that and cut everything else.
 
-### Phase 6 — Worktrees + context packets *(~1.5 h)*
-**Objective:** safe parallel writes and real inter-task context.
-**Files:** `server/src/workspace/worktree.ts` · `server/src/context/{build.ts,render.ts,summary.ts}`
-**APIs:** artifact fetch endpoint.
-**Tests:** worktree create/diff/remove against a temp repo; dirty-tree detection; summary-block parse incl. the malformed path.
-**Done when:** a writing task produces `patch.diff` in an isolated worktree and a downstream task receives its summary.
-
-### Phase 7 — Scheduler + SSE *(~2 h)*
-**Objective:** the run actually orchestrates.
-**Files:** `server/src/scheduler/scheduler.ts` · `server/src/bus/index.ts` · `server/src/http/events.ts` · `web/src/pages/Execution.tsx` · `web/src/hooks/useRunEvents.ts`
-**APIs:** `POST /api/runs/:id/start`, `/cancel`, `GET /api/runs/:id/events`
-**Tests:** ready-set ordering on a fixture DAG; failure → dependents `blocked`; concurrency cap respected; cancellation kills the group.
-**Done when:** a 4-task plan executes with visible parallelism and live updates.
-
-### Phase 8 — Usage + baseline *(~1.5 h)*
-**Objective:** the economics story.
-**Files:** `server/src/usage/{cost.ts,aggregate.ts,baseline.ts}` · `server/src/http/usage.ts` · `web/src/pages/Usage.tsx` · `web/src/components/{UsageBars,BaselinePanel}.tsx`
-**Tests:** exact-vs-derived-vs-unknown resolution; excluded tasks removed from **both** sides of the baseline; totals match the sum of task rows.
-**Done when:** Usage shows cost/tokens by model and baseline vs actual with the assumptions block.
-
-### Phase 9 — EverOS memory *(~1.5 h)*
-**Objective:** memory that changes the next plan.
-**Files:** `server/src/memory/{client.ts,write.ts,read.ts,outbox.ts}` · `server/src/http/memory.ts` · Settings panel
-**APIs:** `GET /api/memory/status`, `POST /api/memory/retry`
-**Tests:** client against a mocked EverOS (add/flush/search); health-fail → outbox, run unaffected.
-**Done when:** run twice on one repo and the second plan's `rationale_summary` cites prior memory.
-
-### Phase 10 — Demo polish *(~1 h)*
-Dashboard, seed script for a demo repo, empty/error states, README with the exact demo script, a `demo:reset` command.
+**Dependencies.** Server: `hono`, `@hono/node-server`, `zod`, `zod-to-json-schema`, `nanoid`. Web: `react`, `react-dom`, `react-router-dom`, `vite`, `@vitejs/plugin-react`, `tailwindcss`, `@tailwindcss/vite`. Dev: `typescript`, `tsx`, `vitest`, `@types/node`. **~13 direct deps, small on purpose.** Deliberately *not* added: a SQLite driver (`node:sqlite` is built in), a charting library, a graph-layout library, a state manager (SSE + `useState` suffices), a component library, `snowflake-sdk`, `@anthropic-ai/claude-agent-sdk` (the CLI is the interface and gives us `total_cost_usd` free).
 
 ---
 
-## 34. File-by-file proposed changes
+## 23. Testing strategy
 
-```
-plan.md                                  this document
-package.json                             workspaces, dev/build/test scripts
-pnpm-workspace.yaml
-tsconfig.base.json
-.gitignore                               node_modules, dist, .env, .worktrees
+**Vitest**, unit-first. The rule: *anything that spends money is behind a fixture.* No E2E browser tests — wrong cost/benefit at this timescale.
 
-packages/core/src/
-  plan.ts            Zod ExecutionPlan + PlannedTask; JSON Schema export
-  catalog.ts         ModelCatalogEntry, HarnessId, ModelId types
-  events.ts          SSE event union
-  usage.ts           NormalizedUsage, CostResolution
-  index.ts
-
-server/src/
-  index.ts           Hono app, 127.0.0.1 bind, static SPA in prod
-  db/schema.sql      DDL from §28
-  db/index.ts        node:sqlite open, pragma, idempotent migrate, typed helpers
-  http/{workspaces,runs,events,models,skills,harnesses,usage,memory}.ts
-  workspace/{register,profile,git,worktree}.ts
-  catalog/{seed,index}.ts
-  skills/discover.ts                     scan workspace + user locations (§10)
-  skills/normalize.ts                    SKILL.md front-matter + flat .md → Skill
-  skills/registry.ts                     precedence resolution, mtime/hash cache
-  skills/resolve.ts                      id[] → instruction text at packet-build time
-  skills/builtin/*.md                    FALLBACK ONLY — shadowed by workspace/user
-  planner/{prompt,run,validate}.ts
-  planner/plan.schema.json               generated from Zod at build
-  scheduler/scheduler.ts
-  harness/{types,supervisor,detect,claude,codex,gemini,index}.ts
-  context/{build,render,summary}.ts
-  usage/{normalize,cost,aggregate,baseline}.ts
-  memory/{client,write,read,outbox}.ts
-  bus/index.ts
-  util/{redact,ndjson,ids}.ts
-
-web/src/
-  main.tsx, App.tsx, api/client.ts, hooks/useRunEvents.ts
-  pages/{Dashboard,NewRun,PlanView,Execution,Usage,Settings}.tsx
-  components/{PlanGraph,AgentCard,Cost,EventLog,UsageBars,BaselinePanel,HarnessStatus}.tsx
-  styles.css
-
-server/test/fixtures/
-  claude-stream.ndjson  codex-events.jsonl  gemini-output.json  plan-valid.json
-  plan-cycle.json       plan-unknown-model.json
-```
-
----
-
-## 35. Dependencies to add
-
-**Server:** `hono`, `@hono/node-server`, `zod`, `zod-to-json-schema`, `nanoid`
-**Web:** `react`, `react-dom`, `react-router-dom`, `vite`, `@vitejs/plugin-react`, `tailwindcss`, `@tailwindcss/vite`
-**Dev:** `typescript`, `tsx`, `vitest`, `@types/node`
-
-**Deliberately not added:** a SQLite driver (`node:sqlite` is built in), a charting library (CSS grid bars), a graph-layout library (topological columns), a state manager (SSE + `useState` suffices), a component library, `snowflake-sdk` (§24), `@anthropic-ai/claude-agent-sdk` (the CLI is the interface, and it gives us `total_cost_usd` for free).
-
-Total new direct dependencies: **~13.** Small on purpose — every dependency is a hackathon risk.
-
----
-
-## 36. Testing strategy
-
-**Vitest**, unit-first. The rule: *anything that spends money is behind a fixture.*
-
-- **Schema/validation (highest value)** — cycles, unknown ids, permission/worktree contradictions, `context_from ⊄ dependencies`, budget overrun. Fixture plans, zero API calls.
-- **Plan immutability boundary** — assert the `ExecutionPlan` Zod schema contains **no** runtime key (`status`, `started_at`, `completed_at`, `cost_usd`, `input_tokens`, `worktree_path`, `exit_code`); assert a written `plan.json` is mode `0444` and that a re-plan creates a new run rather than mutating the existing file.
-- **Skill registry** — precedence across all five locations; workspace skill shadows same-id built-in; malformed front-matter skipped not thrown; **`model:` in a skill file is rejected**; `Skill` type has no `model`/`harness` key; mtime/hash change forces a re-read; instruction text is resolved from the source path, not from the DB.
-- **Worker/subagent boundary** — assert no adapter passes `--agents`, and that the Agent tool never appears in a worker's `--allowedTools`.
+- **Schema/validation (highest value)** — cycles, unknown ids, permission/worktree contradictions, `context_from ⊄ dependencies`, budget overrun. Checked-in fixture plans, zero API calls.
+- **Plan immutability boundary** — the `ExecutionPlan` schema contains **no** runtime key (`status`, `started_at`, `completed_at`, `cost_usd`, `input_tokens`, `worktree_path`, `exit_code`); a written `plan.json` is mode `0444`; a re-plan creates a new run rather than mutating the file.
+- **Skill registry** — precedence across all five locations; a workspace skill shadows a same-id built-in; malformed front-matter skipped not thrown; **`model:` in a skill file is rejected**; `Skill` has no `model`/`harness` key; an mtime/hash change forces a re-read; instruction text resolves from the source path, not the DB.
+- **Worker/subagent boundary** — no adapter passes `--agents`; the Agent tool never appears in a worker's `--allowedTools`.
 - **Adapter parsers** — checked-in stdout fixtures per harness → expected `NormalizedUsage`. Catches the Codex-cumulative and Gemini-`total` traps that would otherwise silently corrupt every cost number.
 - **Cost + baseline** — exact/derived/unknown resolution; excluded tasks removed from both sides; aggregates match row sums.
 - **Scheduler** — fixture DAG: ready-set order, concurrency cap, failure→`blocked` propagation, cancellation.
 - **Git/worktree** — against a `mkdtemp` repo: create, diff, dirty detection, remove.
-- **Security guardrail** — assert no adapter's argv can contain `--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, or `--yolo`.
+- **Security guardrail** — no adapter's argv can contain `--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, or `--yolo`.
 - **EverOS client** — against a stubbed HTTP server; assert graceful degradation.
-- **One live smoke test**, `pnpm test:live`, excluded from the default run: a trivial read-only task per harness, asserting exit 0 and non-zero tokens. **Run this first at implementation time** to confirm the three output schemas against the installed CLI versions before building parsers on top of them.
+- **One live smoke test**, `pnpm test:live`, excluded from the default run: a trivial read-only task per harness asserting exit 0 and non-zero tokens.
 
-No E2E browser tests — wrong cost/benefit at this timescale.
-
----
-
-## 37. Demo flow
-
-*Target: 4 minutes.*
-
-1. **Settings (25s)** — three harnesses detected, versions, authenticated: *"everything runs locally; the app never holds a provider key."* Scroll to Skills: they were **discovered** from the repo's own `.claude/skills/` and from user-level directories, shown with their real source paths. *"We didn't invent a skill format — we read the ones you already have. And none of them names a model: a skill is knowledge; the planner decides who applies it."*
-2. **New Run (20s)** — select a prepared TypeScript repo. Goal: *"Find and fix the race condition in quote submission, and add a regression test."* Click **Create Plan**.
-3. **Plan View (75s) — the centrepiece.** The DAG appears *before anything executes*. Walk one card: Explorer on Gemini Flash, read-only, `repo-exploration` skill — *"cheap model, this is scanning."* Then Architect on Claude Opus 5 — *"expensive model, the reasoning here is high-leverage."* Then Implementer on Codex `gpt-5.6-sol` in a dedicated worktree. Then Reviewer on Claude Sonnet 5 with the diff. **Read one `model_rationale` aloud.** "This isn't a router picking a model per prompt — the planner allocated a team, and it decided the split and the staffing in the same breath." Then open `~/.agentplan/runs/<id>/plan.json` in a terminal: *"this file is the product. It's frozen — nothing downstream can edit it, which is exactly why we can later ask whether the allocation was any good."*
-4. **Execution (60s)** — Start Run. Two agents go green in parallel. Tokens and cost tick up live. Point at the worktree path: *"the implementer is writing in an isolated git worktree; nothing else can stomp it."*
-5. **Result (20s)** — open `patch.diff` and the reviewer's summary.
-6. **Usage (40s)** — cost by model; four different models on one goal. Baseline $1.84 → actual $0.42, 77% saved. **Point at the assumptions line**: "estimated, token counts held constant, one task excluded — we're not going to hand-wave the number."
-7. **Memory (30s)** — re-run the same goal. The new plan's rationale cites prior EverOS memory: *"Codex handled bounded test-writing on this repo successfully."* Open `~/.everos` and show the Markdown file. "The memory is a file you own, not a vendor's database."
+Fixtures: `server/test/fixtures/{claude-stream.ndjson, codex-events.jsonl, gemini-output.json, plan-valid.json, plan-cycle.json, plan-unknown-model.json}`.
 
 ---
 
-## 38. Risks and unknowns
+## 24. Risks and unknowns
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| **Harness output schemas differ from docs on the installed versions** | **High** | Run `pnpm test:live` on day 1 and capture real fixtures *before* writing parsers. This is the single highest-value first action. |
-| Codex/Gemini token fields shift between versions | Med | Parsers are defensive: missing field → 0 + a warn log, never a crash |
-| Subscription auth means no true marginal cost | Med | Labelled everywhere (§21/22). Turned into a *credibility* asset by being explicit rather than a weakness |
+| **Harness output schemas differ from docs on the installed versions** | **High** | Run the live smoke on day 1 and capture real fixtures *before* writing parsers. The single highest-value first action |
+| EverOS needs OpenRouter + DeepInfra keys | **Med-High** | **Verify day 1.** Outbox + degradation means the demo survives without it, but the EverMind story doesn't |
+| Codex/Gemini token fields shift between versions | Med | Defensive parsers: missing field → 0 + a warn log, never a crash |
+| Subscription auth means no true marginal cost | Med | Labelled everywhere (§16). Turned into a credibility asset by being explicit |
 | Planner emits a plausible but unexecutable plan | Med | Five validation gates + one bounded re-plan |
-| Planner is slow (frontier + repo reads) | Med | `--effort high` not `max`; `--max-budget-usd`; the UI streams "planning…" with elapsed time |
-| EverOS needs OpenRouter + DeepInfra keys | **Med-High** | **Verify on day 1.** Outbox + graceful degradation means the demo survives without it, but the EverMind story doesn't — so confirm keys early |
-| `node:sqlite` is flagged experimental | Low | Verified working on Node 25.1.0; `better-sqlite3` is a same-API fallback |
-| Worktree churn / branch-name collisions | Low | Run-scoped branch names; suffix-and-retry once |
+| Planner is slow (frontier + repo reads) | Med | `--effort high` not `max`; `--max-budget-usd`; UI streams "planning…" with elapsed time |
+| DAG visualization eats the schedule | Med | Layered columns, not force-directed; timeboxed to Phase 4; a plain list is the acceptable fallback |
+| Snowflake absence costs judging points | Med | User's call. Mitigated by a sync-ready schema (§16) and an honest "here's the 60-line addition" answer |
 | Parallel CLIs hit provider rate limits | Low-Med | Default concurrency 3; per-task failures don't kill the run |
-| DAG visualization eats the schedule | Med | Layered columns, not force-directed. Timeboxed to Phase 4; a plain list is the acceptable fallback |
-| Two of four agents write to the same files | Low | Planner is instructed toward disjoint file sets; worktrees make collisions non-destructive; no auto-merge |
-| Snowflake absence costs judging points | Med | User's call. Mitigated by a sync-ready schema (§24) and an honest "here's the 60-line addition" answer if asked |
+| `node:sqlite` is flagged experimental | Low | Verified on Node 25.1.0; `better-sqlite3` is a same-API fallback |
+| Worktree churn / branch-name collisions | Low | Run-scoped branch names; suffix-and-retry once |
+| Two agents write the same files | Low | Planner instructed toward disjoint file sets; worktrees make collisions non-destructive; no auto-merge |
 
-**Open unknowns to resolve on day 1:** exact `structured_output` placement in the `claude -p --json-schema --output-format json` payload; whether `gemini --output-format json` includes `stats` on every run or only with tool use; whether Codex `--output-schema` is worth using for implementer tasks or whether the prompted summary contract is enough.
-
----
-
-## 39. Explicit non-goals
-
-- Hosted/multi-user SaaS, auth, RBAC.
-- A generic model-routing gateway or an OpenRouter-style API.
-- Reimplementing any coding agent's inner loop.
-- Automatic merging, rebasing, or conflict resolution.
-- Automatic replanning or escalation at runtime (schema field only).
-- Container/VM sandboxing beyond each harness's own sandbox flags.
-- Fine-grained benchmark scores for models — we ship curated tags and say so.
-- **Skills that carry a model or harness.** Structurally prohibited (§10), not merely discouraged.
-- **An app-owned skill format.** We read `.agents/skills/` and `.claude/skills/` as they are; we do not define a competing one or import copies into the app.
-- **Claude Code native subagents as the execution unit.** Workers are separate processes behind adapters (§11).
-- Mutating a plan after validation — a re-plan creates a new run.
-- Chain-of-thought display.
-- Cost figures presented as exact when they are estimated.
-- **Snowflake integration** (per user decision; schema kept sync-ready).
-- Windows support (macOS/Linux; POSIX process groups assumed).
+**Open unknowns to resolve on day 1:** exact `structured_output` placement in the `claude -p --json-schema --output-format json` payload; whether `gemini --output-format json` includes `stats` on every run or only with tool use; whether Codex `--output-schema` beats the prompted summary contract for implementer tasks.
 
 ---
 
-## 40. Post-hackathon extensions
+## 25. Demo flow
 
-1. **Snowflake telemetry sync** — the `synced_at` outbox drain described in §24. First on the list.
-2. **Runtime escalation** — execute the `escalation` field: on failure, retry on a stronger model and record the delta as evidence for the catalog.
-3. **Learned routing priors** — use accumulated EverOS memory to propose catalog tag adjustments per repo/task shape.
-4. **Real A/B cost evidence** — run the same goal under the routed plan and an all-frontier plan and measure the true difference, replacing the held-constant-tokens assumption in §22.
-5. **Merge assistance** — sequential worktree integration with conflict *detection* (still never auto-resolution).
-6. **More harnesses** — `opencode` is already installed on this machine; the adapter interface takes it without redesign.
-7. **Local models** — the catalog already has a `local` flag; an Ollama harness fits the same interface.
-8. **Prompt-cache-aware planning** — order context packets so sibling tasks share a cacheable prefix.
-9. **Plan diffing** — show what changed between re-plans of the same goal.
-10. **OS keychain** — for the day a first-party API key is genuinely required.
+*Target: 4 minutes.*
+
+1. **Settings (25s)** — three harnesses detected and authenticated: *"everything runs locally; the app never holds a provider key."* Scroll to Skills, shown with real source paths: *"we didn't invent a skill format — we read the ones you already have. And none of them names a model: a skill is knowledge; the planner decides who applies it."*
+2. **New Run (20s)** — a prepared TypeScript repo. Goal: *"Find and fix the race condition in quote submission, and add a regression test."* **Create Plan**.
+3. **Plan View (75s) — the centrepiece.** The DAG appears *before anything executes*. Walk one card: Explorer on Gemini Flash, read-only, `repo-exploration` — *"cheap model, this is scanning."* Then Architect on Claude Opus 5 — *"expensive model, high-leverage reasoning."* Then Implementer on Codex `gpt-5.6-sol` in a dedicated worktree. Then Reviewer on Claude Sonnet 5 with the diff. **Read one `model_rationale` aloud.** *"This isn't a router picking a model per prompt — the planner allocated a team, and decided the split and the staffing in the same breath."* Open `~/.agentplan/runs/<id>/plan.json` in a terminal: *"this file is the product. It's frozen — which is exactly why we can later ask whether the allocation was any good."*
+4. **Execution (60s)** — Start Run. Two agents go green in parallel; tokens and cost tick live. Point at the worktree path: *"the implementer is writing in an isolated git worktree; nothing else can stomp it."*
+5. **Result (20s)** — open `patch.diff` and the reviewer's summary.
+6. **Usage (40s)** — four models on one goal. Baseline $1.84 → actual $0.42, 77% saved. **Point at the assumptions line:** *"estimated, token counts held constant, one task excluded — we're not going to hand-wave the number."*
+7. **Memory (30s)** — re-run the same goal; the new plan's rationale cites prior EverOS memory. Open `~/.everos` and show the Markdown file: *"the memory is a file you own, not a vendor's database."*
 
 ---
 
-## Verification
+## 26. Verification
 
 **Static:** `pnpm -r typecheck` · `pnpm -r test` (all fixture-driven, no spend).
 
 **Live smoke — run this FIRST, before building parsers:**
 ```bash
-# Confirm each harness's real output shape on the installed versions
 claude -p "Reply with the single word OK" --output-format json --allowedTools "" | jq '{result,total_cost_usd,usage,session_id}'
 codex exec "Reply with the single word OK" --json --sandbox read-only --skip-git-repo-check | tail -5
 gemini "Reply with the single word OK" --output-format json | jq '.stats'
@@ -1368,51 +956,165 @@ Capture each into `server/test/fixtures/` and build the parsers against reality.
 1. `pnpm dev` → `http://localhost:5173`.
 2. Settings: all three harnesses green; EverOS reachable.
 3. Register a small TypeScript repo with a known bug.
-4. New Run → goal → **Create Plan**; confirm ≥3 tasks, ≥2 distinct harnesses, every task has a `model_rationale`.
+4. New Run → goal → **Create Plan**; confirm ≥3 tasks, ≥2 distinct harnesses, a `model_rationale` on every task.
 5. Plan View: DAG, dependencies, permissions, estimates all render.
-6. **Start Run**; confirm real parallelism, live token/cost ticks, and a worktree at `<repo>/.worktrees/<runId>/<taskId>`.
+6. **Start Run**; confirm real parallelism, live token/cost ticks, a worktree at `<repo>/.worktrees/<runId>/<taskId>`.
 7. Inspect `patch.diff` and `summary.json` under `~/.agentplan/runs/<runId>/tasks/<taskId>/`.
 8. Usage: per-model cost, provenance badges, baseline vs actual with assumptions.
-9. **Cancel test:** start a run, cancel mid-flight; confirm no orphaned processes (`pgrep -f codex`) and that worktrees survive.
-10. **Restart test:** kill the server mid-run, restart; confirm the run is marked `failed (interrupted_by_restart)` and history is intact.
+9. **Cancel test:** cancel mid-flight; confirm no orphaned processes (`pgrep -f codex`) and surviving worktrees.
+10. **Restart test:** kill the server mid-run, restart; confirm `failed (interrupted_by_restart)` and intact history.
 11. **Memory test:** re-run the same goal; confirm the new plan cites prior memory and `~/.everos` contains the Markdown.
 
 ---
 
-## Recommended Hackathon Build Order
+## 27. Post-hackathon extensions
 
-The smallest sequence that yields a real, demoable system. Build strictly in order; each step is demoable on its own.
+1. **Snowflake telemetry sync** — the `synced_at` outbox drain (§16). First on the list.
+2. **Runtime escalation** — execute the `escalation` field: on failure retry on a stronger model, recording the delta as catalog evidence.
+3. **Learned routing priors** — use accumulated EverOS memory to propose catalog tag adjustments per repo/task shape.
+4. **Real A/B cost evidence** — run the same goal under the routed plan and an all-frontier plan, replacing the held-constant-tokens assumption.
+5. **Merge assistance** — sequential worktree integration with conflict *detection* (never auto-resolution).
+6. **More harnesses** — `opencode` is already installed here; the adapter interface takes it without redesign.
+7. **Local models** — the catalog already has a `local` flag; an Ollama harness fits the same interface.
+8. **Prompt-cache-aware planning** — order packets so sibling tasks share a cacheable prefix.
+9. **Plan diffing** — show what changed between re-plans of the same goal.
+10. **OS keychain** — for the day a first-party API key is genuinely required.
 
-### MUST HAVE — without these there is no product
-1. **Live smoke test of all three CLIs + EverOS; capture real output fixtures.** *(30 min)* Everything downstream is built on these schemas. Do this before writing any parser.
-2. **Phase 0 scaffold** — `pnpm dev` boots. *(45 min)*
-3. **Phase 1 persistence + workspace registration** with git profiling. *(1 h)*
-4. **Phase 2 catalog + skill discovery + harness detection.** *(1.5 h)*
-5. **Phase 3 plan schema + planner + validation + frozen `plan.json`.** *(2 h)* — **the core differentiator.**
-6. **Phase 4 Plan View** with per-task model/harness/skills/deps/**rationale**. *(1.5 h)* — the screen the demo is built around.
-7. **Phase 5 adapters** for **at least Claude Code + one other**. *(2.5 h)*
-8. **Phase 6 worktrees + context packets.** *(1.5 h)*
-9. **Phase 7 scheduler + SSE Execution view.** *(2 h)*
-10. **Phase 8 usage + baseline vs actual.** *(1.5 h)* — Track 1 requires the cost story.
+---
 
-*Cumulative: ~14.5 h. This is a complete, honest, demoable submission.*
+## 28. TUI rules
 
-### SHOULD HAVE — materially better submission
-11. **Phase 9 EverOS memory** (write + read + memory-visible-in-second-plan). *(1.5 h)* — the sponsor requirement and the strongest narrative beat. Promote above #10 if EverOS keys are confirmed working early.
-12. **Third harness adapter** (Gemini), so the plan visibly spans three providers. *(45 min)*
-13. **`<PlanGraph>` upgrade** from list to layered DAG with edges. *(45 min)*
-14. **Dashboard + run history.** *(45 min)*
-15. **Cancellation + restart recovery.** *(45 min)*
+**Supersedes §18 (Frontend) and §19 (API and event streaming).** There is no web UI, no HTTP
+API, and no SSE bus. Decision taken during plan review; the rest of this section is binding.
 
-### CUT IF TIME IS SHORT — in this order
-16. **Dashboard page** → the Usage page covers it.
-17. **DAG edges** → an indented, dependency-grouped list reads fine at projector distance.
-18. **Third harness** → two harnesses already prove heterogeneous assignment.
-19. **Model catalog editing UI** → seed-only; edit the DB directly.
-20. **Artifact viewer in-app** → open files in an editor during the demo.
-21. **Outbox retry UI** → log-only.
-22. **Redaction pass** → keep the demo repo secret-free instead.
-23. **Restart recovery** → don't kill the server during the demo.
-24. **Escalation, replanning, plan diffing, merge assistance** → already non-goals.
+### 28.1 Stack
 
-**The one-line fallback if everything slips:** an immutable `plan.json` that visibly assigns **different models on different harnesses** to different work units — each with selected skills and a written rationale — then executes across at least two harnesses as separate processes, with a per-model cost breakdown. That is the whole idea. Ship that and cut everything else.
+**Ink (React for the terminal) on Node 22, single process, pnpm.**
+
+Chosen because the DAG is the centrepiece and Ink lets each node be a React component with
+the same mental model as the original Vite plan — no new paradigm, no renderer to hand-roll.
+Rejected: Textual (Python — wrong runtime for the Node adapters), Bubbletea (no Go toolchain
+installed), raw ANSI (the DAG is too much layout to hand-roll under time pressure).
+
+```
+apps/cli
+├─ tui/          Ink components (Plan, Run, Usage views)
+├─ core/         scheduler, adapters, catalog, validation
+└─ store/        SQLite (node:sqlite), plan.json writer
+```
+
+### 28.2 The architecture consequence — this is the point
+
+The TUI **is** the supervisor process. Scheduler, harness adapters, and renderer share one
+Node process and one `EventEmitter`. Deleting the browser deletes the entire transport tier:
+
+| Dropped | Reason |
+| --- | --- |
+| HTTP API layer | Nothing crosses a process boundary |
+| SSE bus + reconnect logic | In-memory events |
+| CORS, ports, two-app dev | Single `pnpm dev` |
+| Client-side state sync | Renderer reads supervisor state directly |
+
+Roughly 2h recovered. That is what pays for the DAG renderer.
+
+### 28.3 Harness ↔ tier mapping (forced by measurement, not preference)
+
+Verified on this machine: Claude Code's system prompt + tool schemas is **~270,000 characters
+(~67k tokens)**. The local model's context window is **32,768**. Claude Code therefore
+*cannot* drive the local model — the harness prompt alone is ~2× the window before any work.
+Confirmed by a live run that failed at 173s with `maximum context length is 32768 tokens`.
+
+| Tier | Harness | Backend | Notes |
+| --- | --- | --- | --- |
+| Frontier | `claude -p` | Anthropic | Emits `total_cost_usd` — real measured figure |
+| Mid | `codex exec` | OpenAI (`~/.codex/auth.json` present) | Own parser |
+| Local | `opencode run` | vLLM Qwen3-4B-AWQ @ `:8000` | Already configured and working; the only harness whose prompt fits 32k |
+
+vLLM serves the **Anthropic Messages API** natively (`/v1/messages`, verified: correct
+envelope, `stop_reason: tool_use`, real `usage` block) — so the `ANTHROPIC_BASE_URL` swap
+works in principle; it is the *context window*, not the protocol, that rules Claude Code out
+of the local tier.
+
+### 28.4 Views
+
+Three, switched with number keys. Each maps to a demo beat.
+
+| Key | View | Beat |
+| --- | --- | --- |
+| `1` | **PLAN** — the frozen DAG, pre-execution | The centrepiece |
+| `2` | **RUN** — live execution | Proves it runs |
+| `3` | **USAGE** — cost by model, baseline vs actual | The track |
+
+`p` create plan · `s` start run · `x` cancel · `q` quit · `↑/↓` select node · `enter` expand
+rationale.
+
+### 28.5 DAG render rules
+
+- **Layered columns, never force-directed.** Column index = dependency depth. Tasks at the
+  same depth stack vertically. Deterministic, no layout solver, no animation.
+- **Fixed node width (28 cols).** Truncate with `…`; never reflow on state change — a node
+  must not move once drawn, or the eye loses it mid-demo.
+- **Edges are box-drawing only** (`│ ├ └ ─`). No unicode arrows, no braille, no emoji.
+- **Every node shows four lines**: task id · model · harness · status+cost. Model and harness
+  are always both visible — that pairing *is* the pitch.
+- **Degrade, don't crash**: terminal under 100 cols falls back to an indented list with the
+  same four fields. Detect once at mount, don't re-layout on resize mid-run.
+
+```
+┌─ PLAN a3f ─────────────────────────────────────────────────┐
+│                                                            │
+│  ┌──────────────────────────┐                              │
+│  │ explore                  │                              │
+│  │ qwen3-4b-awq             │──┐                           │
+│  │ opencode → vllm          │  │  ┌──────────────────────┐ │
+│  │ ● done          $0.0000  │  ├─▶│ architect            │ │
+│  └──────────────────────────┘  │  │ claude-opus-5        │ │
+│  ┌──────────────────────────┐  │  │ claude               │ │
+│  │ scan-tests               │──┘  │ ◐ running    $0.0412 │ │
+│  │ qwen3-4b-awq             │     └──────────────────────┘ │
+│  │ opencode → vllm          │                              │
+│  │ ● done          $0.0000  │                              │
+│  └──────────────────────────┘                              │
+└────────────────────────────────────────────────────────────┘
+  routed $0.041   baseline $0.184   ▼ 78%      ●● 1 running
+```
+
+### 28.6 Status vocabulary
+
+One glyph, one colour, no ambiguity. **16-colour ANSI only** — 256-colour and dim/faint
+render unpredictably on a projector.
+
+| Glyph | Colour | State |
+| --- | --- | --- |
+| `○` | grey | queued |
+| `◐` | yellow | running (spinner cycles `◐◓◑◒`, 200ms) |
+| `●` | green | done |
+| `✗` | red | failed |
+| `⊘` | grey | skipped (upstream failed) |
+
+Never encode meaning in colour alone — the glyph carries it too.
+
+### 28.7 Redraw discipline
+
+- **Throttle renders to 10fps.** Adapter events arrive in bursts; unthrottled Ink redraws
+  flicker badly on a projector.
+- **Cost tickers animate, layout does not.** Numbers update in place; node positions are
+  frozen at plan time.
+- **Never clear the screen on state change.** Full clears read as a crash to an audience.
+- Log lines go to a file, not the TUI. Stray adapter stdout must not corrupt the frame —
+  capture child stdio, never inherit.
+
+### 28.8 Legibility (projector)
+
+Non-negotiable, and cheap:
+
+- Rehearse at **large terminal font** (≈22pt+), and size the layout for **100×30** — not for
+  your 4K display. Test by shrinking the window before demo day.
+- High-contrast light-on-dark. No dim, no italics, no background colours behind text.
+- The savings figure renders in a **bordered box, on its own line**, never inline in prose.
+
+### 28.9 Out of scope
+
+Mouse support · scrollback · resize reflow mid-run · theming · a settings *editor* (roster is
+read from a seeded config file; §21 cut the settings tour from the demo) · log viewer ·
+diff viewer.
